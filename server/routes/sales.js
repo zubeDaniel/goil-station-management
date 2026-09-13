@@ -11,13 +11,61 @@ const { authenticate, adminOrManager } = require('../middleware/auth');
 // /meter call but left the field editable, and the server just inserted
 // whatever arrived — meaning the one number meant to catch a shortfall
 // could be silently overwritten, by a bug or otherwise, with no backstop.
+// RTT (Return to Tank) litres were metered out at the nozzle — amount_ghs
+// on pump_meter_readings is closing_meter minus opening_meter times price,
+// and that subtraction has no idea some of those litres went back in the
+// tank rather than home with a customer — so amount_ghs already includes
+// RTT's value. No cash was ever collected for it. Left unadjusted, every
+// RTT day makes this cross-check baseline look higher than the physical
+// cash actually taken, producing a variance that looks like a shortfall
+// but is really just an unadjusted formula (confirmed against the Aug
+// 2026 report: 08-21, 08-27, 08-29 — the station's worst-variance days —
+// are exactly the days with the largest RTT figures).
+//
+// This intentionally does NOT touch litres_sold or amount_ghs themselves
+// on pump_meter_readings — those stay as pure meter-flow figures, which is
+// what Tank Stock needs for its own reconciliation (fuel physically left
+// the nozzle and, via RTT, physically came back into the tank — the dip
+// reading captures that on its own). The adjustment belongs here, in the
+// money cross-check, not at the meter.
 async function deriveMeterAmount(supabaseAdmin, entryDate) {
   const { data: readings, error } = await supabaseAdmin
     .from('pump_meter_readings')
-    .select('amount_ghs')
+    .select('amount_ghs, rtt_litres, fuel_type')
     .eq('reading_date', entryDate);
   if (error) throw new Error(`Failed to derive meter amount: ${error.message}`);
-  return (readings || []).reduce((sum, r) => sum + (parseFloat(r.amount_ghs) || 0), 0);
+
+  const rows = readings || [];
+  const grossAmount = rows.reduce((sum, r) => sum + (parseFloat(r.amount_ghs) || 0), 0);
+
+  const rttRows = rows.filter(r => parseFloat(r.rtt_litres) > 0);
+  if (rttRows.length === 0) return grossAmount;
+
+  // One price lookup per fuel type actually present with RTT that day
+  // (at most 2 — SXP, DXP) rather than one per row.
+  const priceCache = {};
+  const getEffectivePrice = async (fuelType) => {
+    if (fuelType in priceCache) return priceCache[fuelType];
+    const { data: priceRow } = await supabaseAdmin
+      .from('fuel_prices')
+      .select('price_per_litre')
+      .eq('fuel_type', fuelType)
+      .lte('effective_date', entryDate)
+      .order('effective_date', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    const price = parseFloat(priceRow?.price_per_litre) || 0;
+    priceCache[fuelType] = price;
+    return price;
+  };
+
+  let rttValue = 0;
+  for (const r of rttRows) {
+    const price = await getEffectivePrice(r.fuel_type);
+    rttValue += parseFloat(r.rtt_litres) * price;
+  }
+
+  return grossAmount - rttValue;
 }
 
 // GET /api/sales
@@ -46,7 +94,7 @@ router.post('/', authenticate, adminOrManager, async (req, res) => {
     const {
       entry_date, coupons_ghs, gocard_ghs,
       momo_ghs, merka_wood_ghs, genset_ghs,
-      lubricant_ghs
+      lubricant_ghs, physical_cash_ghs
     } = req.body;
 
     if (!entry_date) {
@@ -55,7 +103,7 @@ router.post('/', authenticate, adminOrManager, async (req, res) => {
     // This table is cross-checked against meter_amount_ghs specifically to
     // catch reporting mismatches — a negative channel value would defeat
     // that check silently instead of surfacing a real variance.
-    for (const [field, value] of Object.entries({ coupons_ghs, gocard_ghs, momo_ghs, merka_wood_ghs, genset_ghs, lubricant_ghs })) {
+    for (const [field, value] of Object.entries({ coupons_ghs, gocard_ghs, momo_ghs, merka_wood_ghs, genset_ghs, lubricant_ghs, physical_cash_ghs })) {
       if (value !== undefined && (!Number.isFinite(Number(value)) || Number(value) < 0)) {
         return res.status(400).json({ error: `${field} must be a non-negative number` });
       }
@@ -68,6 +116,11 @@ router.post('/', authenticate, adminOrManager, async (req, res) => {
 
     // RTT is NEVER accepted as input here. meter_amount_ghs is never
     // accepted from the client either — see deriveMeterAmount() above.
+    // physical_cash_ghs is the till-counted cash channel — previously
+    // absent from this table entirely, so cash sales (the station's
+    // largest single channel per the physical ledger) never appeared in
+    // total_sales_ghs, and every day's variance was short by roughly the
+    // day's cash total regardless of whether anything was actually wrong.
     const { data, error } = await req.supabaseAdmin
       .from('sales_book')
       .insert({
@@ -78,6 +131,7 @@ router.post('/', authenticate, adminOrManager, async (req, res) => {
         merka_wood_ghs: merka_wood_ghs || 0,
         genset_ghs: genset_ghs || 0,
         lubricant_ghs: lubricant_ghs || 0,
+        physical_cash_ghs: physical_cash_ghs || 0,
         meter_amount_ghs: meterAmountGhs,
         created_by: req.user.id
       })
@@ -102,7 +156,7 @@ router.put('/:id', authenticate, adminOrManager, async (req, res) => {
     const {
       coupons_ghs, gocard_ghs,
       momo_ghs, merka_wood_ghs, genset_ghs,
-      lubricant_ghs
+      lubricant_ghs, physical_cash_ghs
     } = req.body;
 
     // entry_date isn't editable here (matches the frontend, which locks
@@ -118,7 +172,7 @@ router.put('/:id', authenticate, adminOrManager, async (req, res) => {
       return res.status(404).json({ error: 'Sales entry not found' });
     }
 
-    for (const [field, value] of Object.entries({ coupons_ghs, gocard_ghs, momo_ghs, merka_wood_ghs, genset_ghs, lubricant_ghs })) {
+    for (const [field, value] of Object.entries({ coupons_ghs, gocard_ghs, momo_ghs, merka_wood_ghs, genset_ghs, lubricant_ghs, physical_cash_ghs })) {
       if (value !== undefined && (!Number.isFinite(Number(value)) || Number(value) < 0)) {
         return res.status(400).json({ error: `${field} must be a non-negative number` });
       }
@@ -135,6 +189,7 @@ router.put('/:id', authenticate, adminOrManager, async (req, res) => {
         merka_wood_ghs: merka_wood_ghs || 0,
         genset_ghs: genset_ghs || 0,
         lubricant_ghs: lubricant_ghs || 0,
+        physical_cash_ghs: physical_cash_ghs || 0,
         meter_amount_ghs: meterAmountGhs,
       })
       .eq('id', req.params.id)

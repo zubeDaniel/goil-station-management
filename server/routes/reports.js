@@ -22,6 +22,45 @@ function monthDateRange(month) {
   return { startDate, endDate };
 }
 
+// ── One-day entry lag — meter readings, Sales Book, Merka Wood credit ──
+//
+// Confirmed against the physical Merka Wood ledger: what's recorded under
+// date N in the system actually happened on date N-1 (staff enter the
+// previous day's business the next morning, tagged with that morning's
+// date). Per Zube's direction this correction applies ONLY to
+// pump_meter_readings, sales_book, and credit_sales — NOT banking (which
+// is deliberately filed by physical deposit-slip date, a separate,
+// intentional lag per the PRD — stacking this fix on top of that one would
+// be wrong) and NOT tank_stock (dip readings aren't reported as lagged).
+//
+// This is a report-generation-only fix: raw stored dates are never
+// altered, no migration, no change to what the entry forms save. Two
+// things have to move together for that to work:
+//   1. The DB query window shifts one day LATER than the calendar month
+//      (query Aug 2 -> Sep 1 to build the "August" report), because the
+//      business-day-August data is stored one day ahead.
+//   2. Each returned row's date field then shifts one day EARLIER before
+//      it's used anywhere downstream, turning stored Aug 2..Sep 1 back
+//      into displayed Aug 1..Aug 31.
+// Skipping step 1 and only relabeling in place would either lose the last
+// business day of the month (Aug 31, stored as Sep 1) or mislabel the
+// first (stored Aug 1 would display as Jul 31 — a different month).
+function shiftDateBack(dateStr) {
+  if (!dateStr) return dateStr;
+  const [y, m, d] = dateStr.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() - 1);
+  return dt.toISOString().slice(0, 10);
+}
+
+function shiftDateForward(dateStr) {
+  if (!dateStr) return dateStr;
+  const [y, m, d] = dateStr.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() + 1);
+  return dt.toISOString().slice(0, 10);
+}
+
 function previousMonthKey(month) {
   const d = new Date(`${month}-01T00:00:00Z`);
   d.setUTCMonth(d.getUTCMonth() - 1);
@@ -42,13 +81,18 @@ function lastNMonths(month, n) {
 // Deliberately not the full assembleReport(): fetching sales/banking/
 // credits/expenses/tanks for 5 extra months just to plot two numbers per
 // month would be wasted work.
+//
+// Uses the same lagged query window as assembleReport() (see shiftDateBack/
+// shiftDateForward above) — pump_meter_readings is one of the affected
+// tables, so this has to stay in sync with Section 1/5's totals for the
+// same month, or the trend chart and the KPI header would disagree.
 async function getMonthlyFuelRevenue(supabaseAdmin, month) {
   const { startDate, endDate } = monthDateRange(month);
   const { data } = await supabaseAdmin
     .from('pump_meter_readings')
     .select('fuel_type, amount_ghs')
-    .gte('reading_date', startDate)
-    .lte('reading_date', endDate);
+    .gte('reading_date', shiftDateForward(startDate))
+    .lte('reading_date', shiftDateForward(endDate));
   const rows = data || [];
   const sxp = rows.filter(r => r.fuel_type === 'SXP').reduce((s, r) => s + parseFloat(r.amount_ghs || 0), 0);
   const dxp = rows.filter(r => r.fuel_type === 'DXP').reduce((s, r) => s + parseFloat(r.amount_ghs || 0), 0);
@@ -173,14 +217,32 @@ async function assembleReport(supabaseAdmin, month) {
 
   const margin = parseFloat(setup?.dealer_margin_per_litre || 0.30);
 
+  // Lagged window for the three affected tables only — see shiftDateBack/
+  // shiftDateForward comment above. Banking, expenses, and tank_stock use
+  // the plain calendar startDate/endDate, untouched.
+  const laggedStart = shiftDateForward(startDate);
+  const laggedEnd = shiftDateForward(endDate);
+
   const [
     meterRes, salesRes, bankingRes,
     creditRes, expensesRes, tankRes
   ] = await Promise.all([
-    supabaseAdmin.from('pump_meter_readings').select('*').gte('reading_date', startDate).lte('reading_date', endDate).order('reading_date', { ascending: true }).order('pump_id', { ascending: true }).order('fuel_type', { ascending: true }),
-    supabaseAdmin.from('sales_book').select('*').gte('entry_date', startDate).lte('entry_date', endDate).order('entry_date', { ascending: true }),
+    supabaseAdmin.from('pump_meter_readings').select('*').gte('reading_date', laggedStart).lte('reading_date', laggedEnd).order('reading_date', { ascending: true }).order('pump_id', { ascending: true }).order('fuel_type', { ascending: true }),
+    supabaseAdmin.from('sales_book').select('*').gte('entry_date', laggedStart).lte('entry_date', laggedEnd).order('entry_date', { ascending: true }),
     supabaseAdmin.from('banking').select('*').gte('entry_date', startDate).lte('entry_date', endDate).order('entry_date', { ascending: true }),
-    supabaseAdmin.from('credit_sales').select('*, creditors(name)').gte('sale_date', startDate).lte('sale_date', endDate).order('sale_date', { ascending: true }),
+    // .is('deleted_at', null) was missing here — the only one of these six
+    // queries without it (compare expenses, one line below). credit_sales
+    // is the one table among these with routine soft-delete traffic (see
+    // reverse_credit_sale / edit_credit_sale in creditors.js, where an edit
+    // is implemented as reverse-then-reinsert), so every deleted or edited
+    // credit sale left a ghost row that still rendered here — the exact
+    // duplicate/repeated-date rows seen in the August 2026 Section 4 report
+    // (e.g. 08-02, 08-10, 08-16, 08-30 all show identical rows twice).
+    // pump_meter_readings / sales_book / banking / tank_stock do NOT have a
+    // deleted_at column at all (sales_book and banking hard-delete; meter
+    // readings have no delete route) — do not add this filter to those,
+    // it would throw a SQL error against a column that doesn't exist.
+    supabaseAdmin.from('credit_sales').select('*, creditors(name)').gte('sale_date', laggedStart).lte('sale_date', laggedEnd).is('deleted_at', null).order('sale_date', { ascending: true }),
     supabaseAdmin.from('expenses').select('*').gte('expense_date', startDate).lte('expense_date', endDate).is('deleted_at', null).order('expense_date', { ascending: true }),
     // ORDER BY here is not cosmetic — summarizeStockMovement() below reads
     // rows[0] as "opening stock" and rows[length-1] as "closing stock".
@@ -191,10 +253,22 @@ async function assembleReport(supabaseAdmin, month) {
     supabaseAdmin.from('tank_stock').select('*').gte('stock_date', startDate).lte('stock_date', endDate).order('stock_date', { ascending: true }),
   ]);
 
-  const meterReadings = meterRes.data || [];
-  const salesBook = salesRes.data || [];
+  // Relabel the lagged tables' rows back onto business dates now that the
+  // query window has done its job — everything downstream (totals, section
+  // payloads, flags) reads these dates and must see Aug 1..Aug 31, not the
+  // stored Aug 2..Sep 1. sort() after mapping because shifting can put a
+  // trailing Sep-1-turned-Aug-31 row out of the date order the query
+  // guaranteed on the original (stored) dates.
+  const meterReadings = (meterRes.data || [])
+    .map(r => ({ ...r, reading_date: shiftDateBack(r.reading_date) }))
+    .sort((a, b) => a.reading_date.localeCompare(b.reading_date) || a.pump_id.localeCompare(b.pump_id) || a.fuel_type.localeCompare(b.fuel_type));
+  const salesBook = (salesRes.data || [])
+    .map(r => ({ ...r, entry_date: shiftDateBack(r.entry_date) }))
+    .sort((a, b) => a.entry_date.localeCompare(b.entry_date));
   const banking = bankingRes.data || [];
-  const creditSales = creditRes.data || [];
+  const creditSales = (creditRes.data || [])
+    .map(r => ({ ...r, sale_date: shiftDateBack(r.sale_date) }))
+    .sort((a, b) => a.sale_date.localeCompare(b.sale_date));
   const expenses = expensesRes.data || [];
   const tankStock = tankRes.data || [];
 

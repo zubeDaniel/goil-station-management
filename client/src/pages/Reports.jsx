@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, Fragment } from 'react'
 import api from '../lib/api'
 import { useToast } from '../components/Toast'
 
@@ -14,6 +14,24 @@ import { useToast } from '../components/Toast'
 // capped correctly, used everywhere.
 const fmt = (n) => parseFloat(n || 0).toLocaleString('en-GH', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 const fmtL = (n) => fmt(n) + ' L'
+
+// Groups a date-bearing array into per-day blocks, sorted by date. Used by
+// Section 1 (Fuel Sales) and Section 7 (Dealer Margin) — both are really
+// one row per pump/fuel per day, which read as a wall of ~155 rows with no
+// way to jump to a given day. Grouping mirrors how Meter Book itself is
+// laid out (one block per day) so the report reads the same way the data
+// was entered.
+const groupByDate = (rows, dateKey) => {
+  const map = new Map()
+  for (const r of rows) {
+    const key = r[dateKey]
+    if (!map.has(key)) map.set(key, [])
+    map.get(key).push(r)
+  }
+  return Array.from(map.entries())
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([date, dayRows]) => ({ date, rows: dayRows }))
+}
 
 export default function Reports() {
   const { showToast } = useToast()
@@ -323,25 +341,47 @@ export default function Reports() {
       doc.text('SECTION 1 — FUEL SALES SUMMARY', ml + 6, y + 2)
       y += 12
 
-      const s1Headers = ['Date', 'Pump', 'Fuel', 'Litres Sold', 'Amount (GHS)', 'RTT (L)']
-      const s1Widths = [25, 18, 15, 30, 42, 22]
-      doc.setFillColor(...ASH)
-      doc.rect(ml, y - 4, cw, 7, 'F')
-      doc.setTextColor(...ORANGE)
-      doc.setFontSize(8)
+      const s1Headers = ['Pump', 'Fuel', 'Litres Sold', 'Amount (GHS)', 'RTT (L)']
+      const s1Widths = [30, 25, 40, 55, 30]
+      const meterByDate = groupByDate(meter, 'reading_date')
       let x = ml
-      s1Headers.forEach((h, i) => { doc.text(h, x + 1, y); x += s1Widths[i] })
-      y += 5
 
-      doc.setTextColor(...DARK_GREY)
-      doc.setFont('helvetica', 'normal')
-      meter.forEach((r, idx) => {
-        checkPage(7)
-        if (idx % 2 === 0) { doc.setFillColor(...LIGHT_ASH); doc.rect(ml, y - 4, cw, 7, 'F') }
-        x = ml
-        const row = [r.reading_date, r.pump_id, r.fuel_type, fmt(r.litres_sold), `GHS ${fmt(r.amount_ghs)}`, fmt(r.rtt_litres)]
-        row.forEach((cell, i) => { doc.text(String(cell), x + 1, y); x += s1Widths[i] })
-        y += 7
+      meterByDate.forEach(({ date, rows }) => {
+        // Try to keep a whole day's block together rather than splitting
+        // it across a page break — date band + column header + every row
+        // for that day, plus a small buffer.
+        checkPage(6 + 5 + rows.length * 7 + 4)
+
+        const dayLitres = rows.reduce((s, r) => s + parseFloat(r.litres_sold || 0), 0)
+        const dayAmount = rows.reduce((s, r) => s + parseFloat(r.amount_ghs || 0), 0)
+        doc.setFillColor(...ORANGE)
+        doc.rect(ml, y - 4, cw, 7, 'F')
+        doc.setTextColor(...WHITE)
+        doc.setFont('helvetica', 'bold')
+        doc.setFontSize(8)
+        doc.text(date, ml + 2, y)
+        doc.text(`${fmtL(dayLitres)}  ·  GHS ${fmt(dayAmount)}`, pw - mr - 1, y, { align: 'right' })
+        y += 6
+
+        doc.setFillColor(...ASH)
+        doc.rect(ml, y - 4, cw, 6, 'F')
+        doc.setTextColor(...ORANGE)
+        doc.setFontSize(7)
+        let hx = ml
+        s1Headers.forEach((h, i) => { doc.text(h, hx + 1, y); hx += s1Widths[i] })
+        y += 5
+
+        doc.setFont('helvetica', 'normal')
+        rows.forEach((r, idx) => {
+          checkPage(7)
+          if (idx % 2 === 0) { doc.setFillColor(...LIGHT_ASH); doc.rect(ml, y - 4, cw, 7, 'F') }
+          doc.setTextColor(...DARK_GREY)
+          let rx = ml
+          const row = [r.pump_id, r.fuel_type, fmt(r.litres_sold), `GHS ${fmt(r.amount_ghs)}`, fmt(r.rtt_litres)]
+          row.forEach((cell, i) => { doc.text(String(cell), rx + 1, y); rx += s1Widths[i] })
+          y += 7
+        })
+        y += 3
       })
 
       checkPage(8)
@@ -350,7 +390,7 @@ export default function Reports() {
       doc.setFont('helvetica', 'bold')
       doc.setTextColor(...DARK_GREY)
       x = ml
-      const s1Totals = ['TOTAL', '', '', fmtL(totalLitres), `GHS ${fmt(totalRevenue)}`, fmtL(meter.reduce((s, r) => s + parseFloat(r.rtt_litres || 0), 0))]
+      const s1Totals = ['MONTH TOTAL', '', fmtL(totalLitres), `GHS ${fmt(totalRevenue)}`, fmtL(meter.reduce((s, r) => s + parseFloat(r.rtt_litres || 0), 0))]
       s1Totals.forEach((cell, i) => { doc.text(String(cell), x + 1, y); x += s1Widths[i] })
       y += 10
 
@@ -358,6 +398,8 @@ export default function Reports() {
       doc.setFontSize(7)
       doc.setTextColor(...MID_GREY)
       doc.text('RTT = Return to Tank. Stock event only — excluded from all revenue totals.', ml, y)
+      y += 4
+      doc.text('Dates shown are business dates, corrected for a confirmed one-day system-entry lag — one day earlier than the raw recorded date.', ml, y)
       y += 8
 
       // ── SECTION 2: SALES BOOK ──────────────────────────
@@ -372,8 +414,8 @@ export default function Reports() {
       doc.text('SECTION 2 — SALES BOOK', ml + 6, y + 2)
       y += 12
 
-      const s2Headers = ['Date', 'Coupons', 'GoCard', 'MoMo', 'Merka', 'Genset', 'Lubricant', 'Total']
-      const s2Widths = [22, 22, 22, 22, 22, 20, 20, 30]
+      const s2Headers = ['Date', 'Cash', 'Coupons', 'GoCard', 'MoMo', 'Merka', 'Genset', 'Lubricant', 'Total']
+      const s2Widths = [20, 20, 18, 18, 18, 20, 16, 16, 34]
       doc.setFillColor(...ASH)
       doc.rect(ml, y - 4, cw, 7, 'F')
       doc.setTextColor(...ORANGE)
@@ -388,10 +430,26 @@ export default function Reports() {
         checkPage(7)
         if (idx % 2 === 0) { doc.setFillColor(...LIGHT_ASH); doc.rect(ml, y - 4, cw, 7, 'F') }
         x = ml
-        const row = [s.entry_date, fmt(s.coupons_ghs), fmt(s.gocard_ghs), fmt(s.momo_ghs), fmt(s.merka_wood_ghs), fmt(s.genset_ghs), fmt(s.lubricant_ghs), `GHS ${fmt(s.total_sales_ghs)}`]
+        const row = [s.entry_date, fmt(s.physical_cash_ghs || 0), fmt(s.coupons_ghs), fmt(s.gocard_ghs), fmt(s.momo_ghs), fmt(s.merka_wood_ghs), fmt(s.genset_ghs), fmt(s.lubricant_ghs), `GHS ${fmt(s.total_sales_ghs)}`]
         row.forEach((cell, i) => { doc.text(String(cell), x + 1, y); x += s2Widths[i] })
         y += 7
       })
+
+      if (sales.length > 0) {
+        checkPage(8)
+        doc.setFillColor(...ASH)
+        doc.rect(ml, y - 4, cw, 8, 'F')
+        doc.setFont('helvetica', 'bold')
+        doc.setTextColor(...DARK_GREY)
+        x = ml
+        const s2Totals = [
+          'TOTAL', '',
+          '', '', '', '', '', '',
+          `GHS ${fmt(sales.reduce((s, r) => s + parseFloat(r.total_sales_ghs || 0), 0))}`,
+        ]
+        s2Totals.forEach((cell, i) => { doc.text(String(cell), x + 1, y); x += s2Widths[i] })
+        y += 10
+      }
 
       if (sales.length === 0) {
         doc.setTextColor(...MID_GREY)
@@ -399,6 +457,12 @@ export default function Reports() {
         doc.text('No data for this period', ml + cw / 2, y + 5, { align: 'center' })
         y += 12
       }
+
+      doc.setFont('helvetica', 'italic')
+      doc.setFontSize(7)
+      doc.setTextColor(...MID_GREY)
+      doc.text('Dates shown are business dates, corrected for a confirmed one-day system-entry lag.', ml, y)
+      y += 8
 
       // ── SECTION 3: BANKING ─────────────────────────────
       checkPage(40)
@@ -483,6 +547,12 @@ export default function Reports() {
         doc.text('No credit sales for this period', ml + cw / 2, y + 5, { align: 'center' })
         y += 12
       }
+
+      doc.setFont('helvetica', 'italic')
+      doc.setFontSize(7)
+      doc.setTextColor(...MID_GREY)
+      doc.text('Dates shown are business dates, corrected for a confirmed one-day system-entry lag.', ml, y)
+      y += 8
 
       // ── SECTION 5: CONSOLIDATED ────────────────────────
       newPage()
@@ -628,31 +698,46 @@ export default function Reports() {
       doc.text(`SECTION 7 — DEALER MARGIN SUMMARY (GHS ${margin}/L)`, ml + 2, y + 2)
       y += 12
 
-      const s7Headers = ['Date', 'Pump', 'Fuel', 'Litres Dispensed', 'Rate (GHS/L)', 'Dealer Earnings']
-      const s7Widths = [30, 20, 20, 40, 35, 35]
-      doc.setFillColor(...GREEN_LIGHT)
-      doc.rect(ml, y - 4, cw, 7, 'F')
-      doc.setTextColor(...GREEN)
-      doc.setFontSize(8)
-      x = ml
-      s7Headers.forEach((h, i) => { doc.text(h, x + 1, y); x += s7Widths[i] })
-      y += 5
+      const s7Headers = ['Pump', 'Fuel', 'Litres Dispensed', 'Rate (GHS/L)', 'Dealer Earnings']
+      const s7Widths = [25, 25, 45, 35, 50]
 
-      doc.setTextColor(...DARK_GREY)
-      doc.setFont('helvetica', 'normal')
-      meter.forEach((r, idx) => {
-        checkPage(7)
-        if (idx % 2 === 0) { doc.setFillColor(...LIGHT_ASH); doc.rect(ml, y - 4, cw, 7, 'F') }
-        x = ml
-        const earnings = parseFloat(r.litres_sold) * margin
-        const row = [r.reading_date, r.pump_id, r.fuel_type, fmtL(r.litres_sold), String(margin), `GHS ${fmt(earnings)}`]
-        row.forEach((cell, i) => {
-          if (i === 5) doc.setTextColor(...GREEN)
-          else doc.setTextColor(...DARK_GREY)
-          doc.text(String(cell), x + 1, y)
-          x += s7Widths[i]
+      meterByDate.forEach(({ date, rows }) => {
+        checkPage(6 + 5 + rows.length * 7 + 4)
+
+        const dayLitres = rows.reduce((s, r) => s + parseFloat(r.litres_sold || 0), 0)
+        const dayEarnings = dayLitres * margin
+        doc.setFillColor(...GREEN)
+        doc.rect(ml, y - 4, cw, 7, 'F')
+        doc.setTextColor(...WHITE)
+        doc.setFont('helvetica', 'bold')
+        doc.setFontSize(8)
+        doc.text(date, ml + 2, y)
+        doc.text(`${fmtL(dayLitres)}  ·  GHS ${fmt(dayEarnings)}`, pw - mr - 1, y, { align: 'right' })
+        y += 6
+
+        doc.setFillColor(...GREEN_LIGHT)
+        doc.rect(ml, y - 4, cw, 6, 'F')
+        doc.setTextColor(...GREEN)
+        doc.setFontSize(7)
+        let hx = ml
+        s7Headers.forEach((h, i) => { doc.text(h, hx + 1, y); hx += s7Widths[i] })
+        y += 5
+
+        doc.setFont('helvetica', 'normal')
+        rows.forEach((r, idx) => {
+          checkPage(7)
+          if (idx % 2 === 0) { doc.setFillColor(...LIGHT_ASH); doc.rect(ml, y - 4, cw, 7, 'F') }
+          let rx = ml
+          const earnings = parseFloat(r.litres_sold) * margin
+          const row = [r.pump_id, r.fuel_type, fmtL(r.litres_sold), String(margin), `GHS ${fmt(earnings)}`]
+          row.forEach((cell, i) => {
+            doc.setTextColor(...(i === 4 ? GREEN : DARK_GREY))
+            doc.text(String(cell), rx + 1, y)
+            rx += s7Widths[i]
+          })
+          y += 7
         })
-        y += 7
+        y += 3
       })
 
       checkPage(10)
@@ -662,11 +747,17 @@ export default function Reports() {
       doc.setFontSize(9)
       doc.setTextColor(...DARK_GREY)
       doc.text('MONTHLY TOTAL', ml + 1, y)
-      doc.text(fmtL(totalLitres), ml + s7Widths[0] + s7Widths[1] + s7Widths[2] + 1, y)
+      doc.text(fmtL(totalLitres), ml + s7Widths[0] + s7Widths[1] + 1, y)
       doc.setTextColor(...GREEN)
       doc.setFontSize(11)
       doc.text(`GHS ${fmt(dealerEarnings)}`, pw - mr, y, { align: 'right' })
       y += 12
+
+      doc.setFont('helvetica', 'italic')
+      doc.setFontSize(7)
+      doc.setTextColor(...MID_GREY)
+      doc.text('Dates shown are business dates, corrected for a confirmed one-day system-entry lag.', ml, y)
+      y += 8
 
       // ── FOOTER on all pages ────────────────────────────
       const totalPages = doc.getNumberOfPages()
@@ -801,30 +892,41 @@ export default function Reports() {
                 <table>
                   <thead>
                     <tr>
-                      <th>Date</th><th>Pump</th><th>Fuel</th>
+                      <th>Pump</th><th>Fuel</th>
                       <th>Litres sold</th><th>Amount (GHS)</th>
                       <th style={{ background: 'var(--amber)' }}>RTT (L)</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {report.section1_fuel_sales.map(r => (
-                      <tr key={r.id}>
-                        <td>{r.reading_date}</td>
-                        <td><span className="badge badge-navy">{r.pump_id}</span></td>
-                        <td><span className={`badge ${r.fuel_type === 'SXP' ? 'badge-blue' : 'badge-amber'}`}>{r.fuel_type}</span></td>
-                        <td className="td-calc">{parseFloat(r.litres_sold).toFixed(2)}</td>
-                        <td className="td-calc">GHS {parseFloat(r.amount_ghs).toFixed(2)}</td>
-                        <td style={{ background: 'var(--amber-subtle)', color: 'var(--amber)', fontFamily: 'var(--font-mono)', fontSize: 12 }}>
-                          {parseFloat(r.rtt_litres).toFixed(2)}
-                        </td>
-                      </tr>
+                    {groupByDate(report.section1_fuel_sales, 'reading_date').map(({ date, rows }) => (
+                      <Fragment key={date}>
+                        <tr>
+                          <td colSpan={5} style={{ background: 'var(--navy-light)', color: 'var(--navy)', fontWeight: 700, fontSize: 12 }}>
+                            {date}
+                            <span style={{ float: 'right', fontWeight: 500, fontFamily: 'var(--font-mono)' }}>
+                              {rows.reduce((s, r) => s + parseFloat(r.litres_sold || 0), 0).toFixed(2)} L · GHS {rows.reduce((s, r) => s + parseFloat(r.amount_ghs || 0), 0).toFixed(2)}
+                            </span>
+                          </td>
+                        </tr>
+                        {rows.map(r => (
+                          <tr key={r.id}>
+                            <td><span className="badge badge-navy">{r.pump_id}</span></td>
+                            <td><span className={`badge ${r.fuel_type === 'SXP' ? 'badge-blue' : 'badge-amber'}`}>{r.fuel_type}</span></td>
+                            <td className="td-calc">{parseFloat(r.litres_sold).toFixed(2)}</td>
+                            <td className="td-calc">GHS {parseFloat(r.amount_ghs).toFixed(2)}</td>
+                            <td style={{ background: 'var(--amber-subtle)', color: 'var(--amber)', fontFamily: 'var(--font-mono)', fontSize: 12 }}>
+                              {parseFloat(r.rtt_litres).toFixed(2)}
+                            </td>
+                          </tr>
+                        ))}
+                      </Fragment>
                     ))}
                     {report.section1_fuel_sales.length === 0 && (
-                      <tr><td colSpan={6} style={{ textAlign: 'center', color: 'var(--text-3)', padding: 24 }}>No data for this period</td></tr>
+                      <tr><td colSpan={5} style={{ textAlign: 'center', color: 'var(--text-3)', padding: 24 }}>No data for this period</td></tr>
                     )}
                     {report.section1_fuel_sales.length > 0 && (
                       <tr className="tr-total">
-                        <td colSpan={3}><strong>Total</strong></td>
+                        <td colSpan={2}><strong>Month total</strong></td>
                         <td className="td-calc"><strong>{parseFloat(s5?.total_litres || 0).toFixed(2)} L</strong></td>
                         <td className="td-calc"><strong>GHS {parseFloat(s5?.total_revenue || 0).toFixed(2)}</strong></td>
                         <td style={{ background: 'var(--amber-subtle)', color: 'var(--amber)', fontWeight: 700 }}>
@@ -836,7 +938,8 @@ export default function Reports() {
                 </table>
               </div>
               <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 8 }}>
-                RTT = Return to Tank. Stock event only — excluded from all revenue totals.
+                RTT = Return to Tank. Stock event only — excluded from all revenue totals.<br />
+                Dates shown are business dates, corrected for a confirmed one-day system-entry lag — one day earlier than the raw recorded date.
               </div>
             </div>
           )}
@@ -851,12 +954,13 @@ export default function Reports() {
               <div className="table-wrap">
                 <table>
                   <thead>
-                    <tr><th>Date</th><th>Coupons</th><th>GoCard</th><th>MoMo</th><th>Merka</th><th>Genset</th><th>Lubricant</th><th>Total</th><th>Variance</th></tr>
+                    <tr><th>Date</th><th>Cash</th><th>Coupons</th><th>GoCard</th><th>MoMo</th><th>Merka</th><th>Genset</th><th>Lubricant</th><th>Total</th><th>Variance</th></tr>
                   </thead>
                   <tbody>
                     {report.section2_sales_book.map(s => (
                       <tr key={s.id}>
                         <td>{s.entry_date}</td>
+                        <td className="td-calc">{parseFloat(s.physical_cash_ghs || 0).toFixed(2)}</td>
                         <td className="td-calc">{parseFloat(s.coupons_ghs).toFixed(2)}</td>
                         <td className="td-calc">{parseFloat(s.gocard_ghs).toFixed(2)}</td>
                         <td className="td-calc">{parseFloat(s.momo_ghs).toFixed(2)}</td>
@@ -868,11 +972,12 @@ export default function Reports() {
                       </tr>
                     ))}
                     {report.section2_sales_book.length === 0 && (
-                      <tr><td colSpan={9} style={{ textAlign: 'center', color: 'var(--text-3)', padding: 24 }}>No data for this period</td></tr>
+                      <tr><td colSpan={10} style={{ textAlign: 'center', color: 'var(--text-3)', padding: 24 }}>No data for this period</td></tr>
                     )}
                     {report.section2_sales_book.length > 0 && (
                       <tr className="tr-total">
                         <td><strong>Total</strong></td>
+                        <td className="td-calc"><strong>{report.section2_sales_book.reduce((s, r) => s + parseFloat(r.physical_cash_ghs || 0), 0).toFixed(2)}</strong></td>
                         <td className="td-calc"><strong>{report.section2_sales_book.reduce((s, r) => s + parseFloat(r.coupons_ghs || 0), 0).toFixed(2)}</strong></td>
                         <td className="td-calc"><strong>{report.section2_sales_book.reduce((s, r) => s + parseFloat(r.gocard_ghs || 0), 0).toFixed(2)}</strong></td>
                         <td className="td-calc"><strong>{report.section2_sales_book.reduce((s, r) => s + parseFloat(r.momo_ghs || 0), 0).toFixed(2)}</strong></td>
@@ -885,6 +990,9 @@ export default function Reports() {
                     )}
                   </tbody>
                 </table>
+              </div>
+              <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 8 }}>
+                Dates shown are business dates, corrected for a confirmed one-day system-entry lag.
               </div>
             </div>
           )}
@@ -965,6 +1073,9 @@ export default function Reports() {
                     )}
                   </tbody>
                 </table>
+              </div>
+              <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 8 }}>
+                Dates shown are business dates, corrected for a confirmed one-day system-entry lag.
               </div>
             </div>
           )}
@@ -1086,27 +1197,42 @@ export default function Reports() {
               <div className="table-wrap">
                 <table>
                   <thead>
-                    <tr><th>Date</th><th>Pump</th><th>Fuel</th><th>Litres</th><th>Rate (GHS/L)</th><th>Dealer earnings</th></tr>
+                    <tr><th>Pump</th><th>Fuel</th><th>Litres</th><th>Rate (GHS/L)</th><th>Dealer earnings</th></tr>
                   </thead>
                   <tbody>
-                    {report.section7_dealer_margin.daily.map(r => (
-                      <tr key={r.id}>
-                        <td>{r.reading_date}</td>
-                        <td><span className="badge badge-navy">{r.pump_id}</span></td>
-                        <td><span className={`badge ${r.fuel_type === 'SXP' ? 'badge-blue' : 'badge-amber'}`}>{r.fuel_type}</span></td>
-                        <td className="td-calc">{parseFloat(r.litres_sold).toFixed(2)}</td>
-                        <td className="td-calc">{report.dealer_margin_per_litre}</td>
-                        <td className="td-calc" style={{ color: 'var(--green)' }}>
-                          GHS {(parseFloat(r.litres_sold) * parseFloat(report.dealer_margin_per_litre)).toFixed(2)}
-                        </td>
-                      </tr>
-                    ))}
+                    {groupByDate(report.section7_dealer_margin.daily, 'reading_date').map(({ date, rows }) => {
+                      const dayLitres = rows.reduce((s, r) => s + parseFloat(r.litres_sold || 0), 0)
+                      const dayEarnings = dayLitres * parseFloat(report.dealer_margin_per_litre)
+                      return (
+                        <Fragment key={date}>
+                          <tr>
+                            <td colSpan={5} style={{ background: 'var(--green-subtle)', color: 'var(--green)', fontWeight: 700, fontSize: 12 }}>
+                              {date}
+                              <span style={{ float: 'right', fontWeight: 500, fontFamily: 'var(--font-mono)' }}>
+                                {dayLitres.toFixed(2)} L · GHS {dayEarnings.toFixed(2)}
+                              </span>
+                            </td>
+                          </tr>
+                          {rows.map(r => (
+                            <tr key={r.id}>
+                              <td><span className="badge badge-navy">{r.pump_id}</span></td>
+                              <td><span className={`badge ${r.fuel_type === 'SXP' ? 'badge-blue' : 'badge-amber'}`}>{r.fuel_type}</span></td>
+                              <td className="td-calc">{parseFloat(r.litres_sold).toFixed(2)}</td>
+                              <td className="td-calc">{report.dealer_margin_per_litre}</td>
+                              <td className="td-calc" style={{ color: 'var(--green)' }}>
+                                GHS {(parseFloat(r.litres_sold) * parseFloat(report.dealer_margin_per_litre)).toFixed(2)}
+                              </td>
+                            </tr>
+                          ))}
+                        </Fragment>
+                      )
+                    })}
                     {report.section7_dealer_margin.daily.length === 0 && (
-                      <tr><td colSpan={6} style={{ textAlign: 'center', color: 'var(--text-3)', padding: 24 }}>No data for this period</td></tr>
+                      <tr><td colSpan={5} style={{ textAlign: 'center', color: 'var(--text-3)', padding: 24 }}>No data for this period</td></tr>
                     )}
                     {report.section7_dealer_margin.daily.length > 0 && (
                       <tr className="tr-total">
-                        <td colSpan={3}><strong>Monthly total</strong></td>
+                        <td colSpan={2}><strong>Monthly total</strong></td>
                         <td className="td-calc"><strong>{parseFloat(s5?.total_litres || 0).toFixed(2)} L</strong></td>
                         <td className="td-calc">{report.dealer_margin_per_litre}</td>
                         <td className="td-calc" style={{ color: 'var(--green)', fontSize: 15 }}>
@@ -1116,6 +1242,9 @@ export default function Reports() {
                     )}
                   </tbody>
                 </table>
+              </div>
+              <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 8 }}>
+                Dates shown are business dates, corrected for a confirmed one-day system-entry lag.
               </div>
             </div>
           )}

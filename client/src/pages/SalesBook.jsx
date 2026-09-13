@@ -11,6 +11,7 @@ export default function SalesBook() {
   const [selectedMonth, setSelectedMonth] = useState(new Date().toISOString().slice(0, 7))
   const [form, setForm] = useState({
     entry_date: new Date().toISOString().split('T')[0],
+    physical_cash_ghs: '0',
     coupons_ghs: '0',
     gocard_ghs: '0',
     momo_ghs: '0',
@@ -19,6 +20,13 @@ export default function SalesBook() {
     lubricant_ghs: '0',
     meter_amount_ghs: ''
   })
+  // Informational only — RTT litres for the selected date, so the form can
+  // show *why* meter_amount_ghs (fetched from the server, already net of
+  // RTT value) is lower than the raw meter total would suggest. The GHS
+  // value of RTT is deliberately not recomputed here — that logic lives
+  // once, server-side, in deriveMeterAmount() (server/routes/sales.js) —
+  // duplicating a price lookup here risks it drifting out of sync.
+  const [rttLitresToday, setRttLitresToday] = useState(0)
 
   const startDate = `${selectedMonth}-01`
   const endDate = new Date(new Date(startDate).getFullYear(), new Date(startDate).getMonth() + 1, 0)
@@ -49,15 +57,39 @@ export default function SalesBook() {
         setForm(p => ({ ...p, merka_wood_ghs: total.toFixed(2) }))
       }).catch(() => {})
 
+    // meter_amount_ghs here is a client-side preview, recomputed
+    // authoritatively server-side at save time — that server figure is
+    // what's actually stored. To match the server's net-of-RTT figure
+    // without a second fuel_prices lookup (one source of truth for price,
+    // not two that could drift), each row's own effective price is derived
+    // from data the row already carries: amount_ghs was computed server
+    // side as litres_sold × price, so amount_ghs / litres_sold *is* that
+    // exact price for that row's date and fuel type — the same value
+    // deriveMeterAmount() would independently look up. Rows with
+    // litres_sold of 0 can't yield a price this way; RTT on a zero-litres
+    // row (rare) isn't deducted from this preview, so it can read slightly
+    // high in that edge case — the saved figure is still correct either
+    // way since the server does its own independent calculation.
     api.get(`/meter?start_date=${form.entry_date}&end_date=${form.entry_date}`)
       .then(res => {
-        const total = res.data.reduce((s, r) => s + parseFloat(r.amount_ghs || 0), 0)
-        setForm(p => ({ ...p, meter_amount_ghs: total.toFixed(2) }))
+        const rows = res.data || []
+        const gross = rows.reduce((s, r) => s + parseFloat(r.amount_ghs || 0), 0)
+        const rttLitres = rows.reduce((s, r) => s + parseFloat(r.rtt_litres || 0), 0)
+        const rttValue = rows.reduce((s, r) => {
+          const litres = parseFloat(r.litres_sold || 0)
+          const rtt = parseFloat(r.rtt_litres || 0)
+          if (rtt <= 0 || litres <= 0) return s
+          const impliedPrice = parseFloat(r.amount_ghs || 0) / litres
+          return s + rtt * impliedPrice
+        }, 0)
+        setForm(p => ({ ...p, meter_amount_ghs: (gross - rttValue).toFixed(2) }))
+        setRttLitresToday(rttLitres)
       }).catch(() => {})
   }, [form.entry_date])
 
   const emptyForm = () => ({
     entry_date: new Date().toISOString().split('T')[0],
+    physical_cash_ghs: '0',
     coupons_ghs: '0', gocard_ghs: '0', momo_ghs: '0',
     merka_wood_ghs: '0', genset_ghs: '0', lubricant_ghs: '0',
     meter_amount_ghs: ''
@@ -87,6 +119,7 @@ export default function SalesBook() {
     setEditingId(row.id)
     setForm({
       entry_date: row.entry_date,
+      physical_cash_ghs: String(row.physical_cash_ghs || 0),
       coupons_ghs: String(row.coupons_ghs || 0),
       gocard_ghs: String(row.gocard_ghs || 0),
       momo_ghs: String(row.momo_ghs || 0),
@@ -116,6 +149,7 @@ export default function SalesBook() {
   }
 
   const channels = [
+    { key: 'physical_cash_ghs', label: 'Physical cash', hint: 'Till-counted cash for the day — previously untracked here, which is why variance ran persistently negative' },
     { key: 'coupons_ghs', label: 'Coupons', hint: 'Revenue from coupon sales today — separate from Banking\'s coupon deposit, which reconciles against this' },
     { key: 'gocard_ghs', label: 'GoCard' },
     { key: 'momo_ghs', label: 'MoMo' },
@@ -228,10 +262,15 @@ export default function SalesBook() {
             </div>
           </div>
 
-          {/* RTT excluded line */}
+          {/* RTT deduction line — real value, not a placeholder. RTT litres
+              were metered (and so are already inside the gross meter total)
+              but physically went back into the tank, not home with a
+              customer — their value is subtracted from meter_amount_ghs
+              server-side (deriveMeterAmount(), server/routes/sales.js)
+              before this form's variance is computed. */}
           <div style={{ padding: '8px 10px', background: 'var(--surface-2)', border: '1px solid var(--border)', borderRadius: 'var(--r-sm)', marginBottom: 12, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-            <span style={{ fontSize: 11, color: 'var(--text-3)' }}>RTT (Return to Tank) — stock event, excluded from revenue</span>
-            <span style={{ fontSize: 11, fontFamily: 'var(--font-mono)', color: 'var(--text-3)' }}>GHS 0.00</span>
+            <span style={{ fontSize: 11, color: 'var(--text-3)' }}>RTT (Return to Tank) returned today — stock event, value already deducted from Meter amount above</span>
+            <span style={{ fontSize: 11, fontFamily: 'var(--font-mono)', color: 'var(--text-3)' }}>{rttLitresToday.toFixed(2)} L</span>
           </div>
 
           <div style={{ display: 'flex', gap: 8 }}>
@@ -283,7 +322,7 @@ export default function SalesBook() {
           <table>
             <thead>
               <tr>
-                <th>Date</th><th>Coupons</th><th>GoCard</th><th>MoMo</th>
+                <th>Date</th><th>Cash</th><th>Coupons</th><th>GoCard</th><th>MoMo</th>
                 <th>Merka</th><th>Genset</th><th>Lubricant</th>
                 <th>Total sales</th><th>Meter amt</th><th>Variance</th><th>Actions</th>
               </tr>
@@ -292,6 +331,7 @@ export default function SalesBook() {
               {sales.map(s => (
                 <tr key={s.id}>
                   <td>{s.entry_date}</td>
+                  <td className="td-calc">{parseFloat(s.physical_cash_ghs || 0).toFixed(2)}</td>
                   <td className="td-calc">{parseFloat(s.coupons_ghs).toFixed(2)}</td>
                   <td className="td-calc">{parseFloat(s.gocard_ghs).toFixed(2)}</td>
                   <td className="td-calc">{parseFloat(s.momo_ghs).toFixed(2)}</td>
@@ -314,7 +354,7 @@ export default function SalesBook() {
                 </tr>
               ))}
               {sales.length === 0 && (
-                <tr><td colSpan={11} style={{ textAlign: 'center', color: 'var(--text-3)', padding: 24 }}>No entries for this month</td></tr>
+                <tr><td colSpan={12} style={{ textAlign: 'center', color: 'var(--text-3)', padding: 24 }}>No entries for this month</td></tr>
               )}
             </tbody>
           </table>
