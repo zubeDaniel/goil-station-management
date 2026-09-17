@@ -198,6 +198,69 @@ function summarizeStockMovement(tankStock) {
   return { sxp, dxp, combined };
 }
 
+// Section 8 rollup: week-of-month litres buckets (days 1–7, 8–14, 15–21,
+// 22–28, 29–end — the last bucket is short by design, not a bug, since
+// months don't divide evenly by 7), each with a total and a daily average
+// (total / days actually in that bucket), split by fuel type and combined.
+// The monthly weekly average is SUM(week totals) / number of buckets —
+// the short trailing bucket is included as-is, which is a deliberate
+// choice (agreed 2026-09-17): it pulls the monthly average down rather
+// than being excluded or padded out to a fake 7-day week.
+//
+// Takes the already-lag-corrected `meterReadings` array assembleReport()
+// already fetched for Section 1/7 — reading_date here is the business
+// date (see shiftDateBack above), so no separate date handling is needed;
+// bucketing purely on day-of-month is correct as-is.
+function computeVolumeAverages(meterReadings, month) {
+  const daysInMonth = new Date(
+    parseInt(month.slice(0, 4), 10),
+    parseInt(month.slice(5, 7), 10),
+    0
+  ).getDate();
+
+  // bucketCount adapts to month length — a non-leap February (28 days)
+  // has exactly 4 buckets and no short 5th one at all.
+  const bucketCount = Math.ceil(daysInMonth / 7);
+  const buckets = Array.from({ length: bucketCount }, (_, i) => {
+    const startDay = i * 7 + 1;
+    const endDay = Math.min(startDay + 6, daysInMonth);
+    return { week: i + 1, startDay, endDay, daysInBucket: endDay - startDay + 1, sxp: 0, dxp: 0 };
+  });
+
+  meterReadings.forEach(r => {
+    const day = parseInt(r.reading_date.slice(8, 10), 10);
+    const bucket = buckets[Math.floor((day - 1) / 7)];
+    if (!bucket) return;
+    if (r.fuel_type === 'SXP') bucket.sxp += parseFloat(r.litres_sold || 0);
+    else if (r.fuel_type === 'DXP') bucket.dxp += parseFloat(r.litres_sold || 0);
+  });
+
+  const weeks = buckets.map(b => ({
+    week: b.week,
+    label: `Days ${b.startDay}–${b.endDay}`,
+    days_in_bucket: b.daysInBucket,
+    sxp_total: b.sxp,
+    dxp_total: b.dxp,
+    combined_total: b.sxp + b.dxp,
+    sxp_daily_avg: b.sxp / b.daysInBucket,
+    dxp_daily_avg: b.dxp / b.daysInBucket,
+    combined_daily_avg: (b.sxp + b.dxp) / b.daysInBucket,
+  }));
+
+  const monthSxpTotal = weeks.reduce((s, w) => s + w.sxp_total, 0);
+  const monthDxpTotal = weeks.reduce((s, w) => s + w.dxp_total, 0);
+
+  return {
+    weeks,
+    monthly: {
+      number_of_weeks: weeks.length,
+      sxp_weekly_avg: monthSxpTotal / weeks.length,
+      dxp_weekly_avg: monthDxpTotal / weeks.length,
+      combined_weekly_avg: (monthSxpTotal + monthDxpTotal) / weeks.length,
+    },
+  };
+}
+
 // Fetches and computes everything needed to render one month's report.
 // Called twice per request to GET /:month — once for the requested month,
 // once for the previous month (month-over-month comparison). Both calls
@@ -317,6 +380,7 @@ async function assembleReport(supabaseAdmin, month) {
       margin_per_litre: margin,
       total_earnings: dealerEarnings,
     },
+    section8_volume_averages: computeVolumeAverages(meterReadings, month),
   };
 }
 

@@ -69,6 +69,10 @@ export default function Reports() {
         section7_dealer_margin: res.data.section7_dealer_margin || {
           daily: [], total_litres: 0, margin_per_litre: 0.30, total_earnings: 0
         },
+        section8_volume_averages: res.data.section8_volume_averages || {
+          weeks: [],
+          monthly: { number_of_weeks: 0, sxp_weekly_avg: 0, dxp_weekly_avg: 0, combined_weekly_avg: 0 },
+        },
         previous_month: res.data.previous_month || { month: null, has_data: false, section5_consolidated: null },
         flags: res.data.flags || [],
         revenue_trend: res.data.revenue_trend || [],
@@ -759,6 +763,74 @@ export default function Reports() {
       doc.text('Dates shown are business dates, corrected for a confirmed one-day system-entry lag.', ml, y)
       y += 8
 
+      // ── SECTION 8: SALES VOLUME AVERAGES ───────────────
+      const s8 = data.section8_volume_averages || { weeks: [], monthly: { sxp_weekly_avg: 0, dxp_weekly_avg: 0, combined_weekly_avg: 0 } }
+      checkPage(50)
+      doc.setFillColor(...DARK_GREY)
+      doc.rect(ml, y - 5, cw, 10, 'F')
+      doc.setFillColor(...ORANGE)
+      doc.rect(ml, y - 5, 3, 10, 'F')
+      doc.setTextColor(...WHITE)
+      doc.setFontSize(10)
+      doc.setFont('helvetica', 'bold')
+      doc.text('SECTION 8 — SALES VOLUME AVERAGES', ml + 6, y + 2)
+      y += 15
+
+      const s8Headers = ['Week', 'Days', 'SXP total (avg/day)', 'DXP total (avg/day)', 'Combined total (avg/day)']
+      const s8Widths = [20, 15, 48, 48, 49]
+      doc.setFillColor(...ASH)
+      doc.rect(ml, y - 4, cw, 7, 'F')
+      doc.setTextColor(...ORANGE)
+      doc.setFontSize(7.5)
+      doc.setFont('helvetica', 'bold')
+      x = ml
+      s8Headers.forEach((h, i) => { doc.text(h, x + 1, y); x += s8Widths[i] })
+      y += 5
+
+      s8.weeks.forEach((w, idx) => {
+        checkPage(7)
+        if (idx % 2 === 0) { doc.setFillColor(...LIGHT_ASH); doc.rect(ml, y - 4, cw, 7, 'F') }
+        doc.setFont('helvetica', 'normal')
+        doc.setTextColor(...DARK_GREY)
+        doc.setFontSize(7.5)
+        x = ml
+        const row = [
+          `W${w.week} (${w.label})`,
+          String(w.days_in_bucket),
+          `${fmtL(w.sxp_total)} (${fmtL(w.sxp_daily_avg)})`,
+          `${fmtL(w.dxp_total)} (${fmtL(w.dxp_daily_avg)})`,
+          `${fmtL(w.combined_total)} (${fmtL(w.combined_daily_avg)})`,
+        ]
+        row.forEach((cell, i) => { doc.text(String(cell), x + 1, y); x += s8Widths[i] })
+        y += 7
+      })
+
+      if (s8.weeks.length === 0) {
+        doc.setFont('helvetica', 'italic')
+        doc.setFontSize(8)
+        doc.setTextColor(...MID_GREY)
+        doc.text('No meter readings for this period.', ml + 1, y)
+        y += 7
+      }
+
+      checkPage(12)
+      doc.setFillColor(...ASH)
+      doc.rect(ml, y - 4, cw, 10, 'F')
+      doc.setFont('helvetica', 'bold')
+      doc.setFontSize(8)
+      doc.setTextColor(...DARK_GREY)
+      doc.text('MONTHLY WEEKLY AVERAGE', ml + 1, y)
+      doc.text(`SXP ${fmtL(s8.monthly.sxp_weekly_avg)}`, ml + s8Widths[0] + s8Widths[1] + 1, y)
+      doc.text(`DXP ${fmtL(s8.monthly.dxp_weekly_avg)}`, ml + s8Widths[0] + s8Widths[1] + s8Widths[2] + 1, y)
+      doc.text(`Combined ${fmtL(s8.monthly.combined_weekly_avg)}`, pw - mr, y, { align: 'right' })
+      y += 12
+
+      doc.setFont('helvetica', 'italic')
+      doc.setFontSize(7)
+      doc.setTextColor(...MID_GREY)
+      doc.text('Week-of-month buckets (not calendar weeks); the trailing bucket is short and included as-is in the monthly average.', ml, y)
+      y += 8
+
       // ── FOOTER on all pages ────────────────────────────
       const totalPages = doc.getNumberOfPages()
       for (let i = 1; i <= totalPages; i++) {
@@ -799,12 +871,13 @@ export default function Reports() {
     { key: 's5', label: 'Section 5', title: 'Consolidated' },
     { key: 's6', label: 'Section 6', title: 'Stock Movement' },
     { key: 's7', label: 'Section 7', title: 'Dealer Margin' },
+    { key: 's8', label: 'Section 8', title: 'Volume Averages' },
   ]
 
   return (
     <div>
       <div className="page-header">
-        <div><h2>Reports</h2><p>Monthly operations report — 7 sections</p></div>
+        <div><h2>Reports</h2><p>Monthly operations report — 8 sections</p></div>
         <div className="page-header-actions">
           <select className="form-select" value={month}
             onChange={e => setMonth(e.target.value)} style={{ width: 160 }}>
@@ -832,7 +905,7 @@ export default function Reports() {
             Select a month and generate the report
           </div>
           <div style={{ fontSize: 13, color: 'var(--text-3)', maxWidth: 400, margin: '0 auto', lineHeight: 1.6 }}>
-            All 7 sections will appear — fuel sales, banking, creditors, stock movement, and dealer margin summary.
+            All 8 sections will appear — fuel sales, banking, creditors, stock movement, dealer margin summary, and volume averages.
           </div>
           <button className="btn btn-primary" style={{ marginTop: 20 }} onClick={loadReport} disabled={loading}>
             <i className="ph ph-chart-bar"></i> Generate report
@@ -1245,6 +1318,66 @@ export default function Reports() {
               </div>
               <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 8 }}>
                 Dates shown are business dates, corrected for a confirmed one-day system-entry lag.
+              </div>
+            </div>
+          )}
+
+          {/* Section 8 */}
+          {activeSection === 's8' && (
+            <div className="card" style={{ borderColor: 'var(--blue-border)' }}>
+              <div className="card-header">
+                <div>
+                  <div className="card-title" style={{ color: 'var(--blue)' }}>Section 8 — Sales Volume Averages</div>
+                  <div className="card-subtitle">Week-of-month buckets (days 1–7, 8–14, …) · daily average per week, weekly average for the month</div>
+                </div>
+              </div>
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Week</th><th>Days</th>
+                      <th>SXP total (L)</th><th>SXP daily avg (L)</th>
+                      <th>DXP total (L)</th><th>DXP daily avg (L)</th>
+                      <th>Combined total (L)</th><th>Combined daily avg (L)</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {report.section8_volume_averages.weeks.map(w => (
+                      <tr key={w.week}>
+                        <td><span className="badge badge-navy">Week {w.week}</span> <span style={{ color: 'var(--text-3)', fontSize: 11 }}>{w.label}</span></td>
+                        <td>{w.days_in_bucket}</td>
+                        <td className="td-calc">{w.sxp_total.toFixed(2)}</td>
+                        <td className="td-calc">{w.sxp_daily_avg.toFixed(2)}</td>
+                        <td className="td-calc">{w.dxp_total.toFixed(2)}</td>
+                        <td className="td-calc">{w.dxp_daily_avg.toFixed(2)}</td>
+                        <td className="td-calc">{w.combined_total.toFixed(2)}</td>
+                        <td className="td-calc">{w.combined_daily_avg.toFixed(2)}</td>
+                      </tr>
+                    ))}
+                    {report.section8_volume_averages.weeks.length === 0 && (
+                      <tr><td colSpan={8} style={{ textAlign: 'center', color: 'var(--text-3)', padding: 24 }}>No meter readings for this period</td></tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+              {report.section8_volume_averages.weeks.length > 0 && (
+                <div className="grid-3" style={{ marginTop: 16 }}>
+                  <div style={{ textAlign: 'center', padding: 12, background: 'var(--blue-subtle)', border: '1px solid var(--blue-border)', borderRadius: 'var(--r-md)' }}>
+                    <div style={{ fontSize: 10, color: 'var(--blue)', textTransform: 'uppercase', fontWeight: 600, marginBottom: 4 }}>SXP weekly avg</div>
+                    <div style={{ fontSize: 18, fontWeight: 700, color: 'var(--blue)', fontFamily: 'var(--font-mono)' }}>{report.section8_volume_averages.monthly.sxp_weekly_avg.toFixed(2)} L</div>
+                  </div>
+                  <div style={{ textAlign: 'center', padding: 12, background: 'var(--blue-subtle)', border: '1px solid var(--blue-border)', borderRadius: 'var(--r-md)' }}>
+                    <div style={{ fontSize: 10, color: 'var(--blue)', textTransform: 'uppercase', fontWeight: 600, marginBottom: 4 }}>DXP weekly avg</div>
+                    <div style={{ fontSize: 18, fontWeight: 700, color: 'var(--blue)', fontFamily: 'var(--font-mono)' }}>{report.section8_volume_averages.monthly.dxp_weekly_avg.toFixed(2)} L</div>
+                  </div>
+                  <div style={{ textAlign: 'center', padding: 12, background: 'var(--navy-light)', border: '1px solid var(--navy-border)', borderRadius: 'var(--r-md)' }}>
+                    <div style={{ fontSize: 10, color: 'var(--navy)', textTransform: 'uppercase', fontWeight: 600, marginBottom: 4 }}>Combined weekly avg</div>
+                    <div style={{ fontSize: 18, fontWeight: 700, color: 'var(--navy)', fontFamily: 'var(--font-mono)' }}>{report.section8_volume_averages.monthly.combined_weekly_avg.toFixed(2)} L</div>
+                  </div>
+                </div>
+              )}
+              <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 8 }}>
+                Buckets are week-of-month (day 1–7, 8–14, …), not calendar weeks, so the trailing bucket is short (2–4 days) and stays inside the month. It's included as-is in the monthly weekly average, which is why that figure runs lower than 7× a typical week's daily average.
               </div>
             </div>
           )}
