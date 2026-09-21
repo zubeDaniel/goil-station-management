@@ -85,6 +85,13 @@ router.post('/credit-sales', authenticate, adminOrManager, async (req, res) => {
     // Recompute amounts server-side using the price effective on sale_date —
     // not whatever the client sent, which uses "current" price regardless of
     // which date was actually selected (wrong when backfilling a past date)
+    //
+    // effective_time tie-break: since 20260918120000_intraday_price_sessions.sql
+    // widened fuel_prices to (fuel_type, effective_date, effective_time),
+    // two rows can share one effective_date — without this secondary sort
+    // the tie resolves arbitrarily (see sales.js's identical fix for the
+    // full explanation). Credit sales, like RTT, are day-level, not
+    // session-split, so "latest price in effect that day" is correct.
     const getEffectivePrice = async (fuelType) => {
       const { data: priceRow } = await req.supabaseAdmin
         .from('fuel_prices')
@@ -92,6 +99,7 @@ router.post('/credit-sales', authenticate, adminOrManager, async (req, res) => {
         .eq('fuel_type', fuelType)
         .lte('effective_date', sale_date)
         .order('effective_date', { ascending: false })
+        .order('effective_time', { ascending: false })
         .limit(1)
         .maybeSingle();
       return parseFloat(priceRow?.price_per_litre) || 0;
@@ -223,7 +231,8 @@ router.put('/credit-sales/:id', authenticate, adminOrManager, async (req, res) =
 
     // Same server-side effective-price recomputation as POST — never
     // trust a client-sent amount, since it may reflect "current" price
-    // rather than the price effective on the selected date.
+    // rather than the price effective on the selected date. Same
+    // effective_time tie-break fix as POST above, and for the same reason.
     const getEffectivePrice = async (fuelType) => {
       const { data: priceRow } = await req.supabaseAdmin
         .from('fuel_prices')
@@ -231,6 +240,7 @@ router.put('/credit-sales/:id', authenticate, adminOrManager, async (req, res) =
         .eq('fuel_type', fuelType)
         .lte('effective_date', sale_date)
         .order('effective_date', { ascending: false })
+        .order('effective_time', { ascending: false })
         .limit(1)
         .maybeSingle();
       return parseFloat(priceRow?.price_per_litre) || 0;

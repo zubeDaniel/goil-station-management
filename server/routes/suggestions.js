@@ -63,6 +63,20 @@ router.post('/:id/approve', authenticate, adminOnly, async (req, res) => {
     // approves a second suggestion for the same fuel on the same day, and
     // the suggestion would be stuck (price never applied, never marked
     // approved either, since that update never runs after this fails).
+    //
+    // onConflict updated to fuel_type,effective_date,effective_time —
+    // the constraint itself was widened to three columns in
+    // 20260918120000_intraday_price_sessions.sql (to allow a genuine
+    // same-day second price for a mid-shift change) and this second write
+    // path was missed in that same pass; left pointing at the old
+    // two-column target, Postgres rejects the upsert outright with "no
+    // unique or exclusion constraint matching the ON CONFLICT
+    // specification" — every approval would fail, not just collide.
+    // effective_time is omitted from the payload below and defaults to
+    // '00:00:00' (an AI-fetched suggestion is always a day-start price,
+    // never a mid-shift entry — that flow only exists through the Meter
+    // Book "Price changed today?" panel), so this still upserts onto the
+    // same day-start row a second approval for the same day would target.
     const { error: priceError } = await req.supabaseAdmin
       .from('fuel_prices')
       .upsert(
@@ -73,7 +87,7 @@ router.post('/:id/approve', authenticate, adminOnly, async (req, res) => {
           npa_reference: suggestion.npa_reference,
           updated_by: req.user.id
         },
-        { onConflict: 'fuel_type,effective_date' }
+        { onConflict: 'fuel_type,effective_date,effective_time' }
       );
 
     if (priceError) {

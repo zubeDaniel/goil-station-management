@@ -46,12 +46,24 @@ async function deriveMeterAmount(supabaseAdmin, entryDate) {
   const priceCache = {};
   const getEffectivePrice = async (fuelType) => {
     if (fuelType in priceCache) return priceCache[fuelType];
+    // effective_time secondary sort: previously effective_date alone was
+    // an unambiguous ordering, because (fuel_type, effective_date) was
+    // unique. Since 20260918120000_intraday_price_sessions.sql widened
+    // that constraint to allow a genuine same-day second price (a
+    // mid-shift change), two rows can now share one effective_date, and
+    // PostgREST gives no ordering guarantee between ties on a single sort
+    // key — which of the two came back was previously impossible, now
+    // silently arbitrary. RTT is deliberately day-level, not
+    // session-split (see the migration's column comments), so "latest
+    // price in effect that day" — i.e. the new price once one exists —
+    // is the correct, deterministic choice here.
     const { data: priceRow } = await supabaseAdmin
       .from('fuel_prices')
       .select('price_per_litre')
       .eq('fuel_type', fuelType)
       .lte('effective_date', entryDate)
       .order('effective_date', { ascending: false })
+      .order('effective_time', { ascending: false })
       .limit(1)
       .maybeSingle();
     const price = parseFloat(priceRow?.price_per_litre) || 0;
