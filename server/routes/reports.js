@@ -145,7 +145,7 @@ function computeFlags({ current, previousSection5, creditors, compliance, today,
   // creditors.current_balance_ghs is TODAY's balance, so a credit-limit flag
   // is only truthful on the current month's report; on a past month it would
   // present today's balance as that month's.
-  (isCurrentMonth ? (creditors || []) : []).forEach(c => {
+  (isCurrentMonth ? (creditors || []).filter(c => c.is_active !== false) : []).forEach(c => {
     const limit = parseFloat(c.credit_limit_ghs || 0);
     const balance = parseFloat(c.current_balance_ghs || 0);
     if (limit > 0) {
@@ -685,7 +685,8 @@ function computeCreditorExposure({ creditors, creditSales, payments, paymentsOk,
     creditors: rows,
     total_credit_sales: totalCredit,
     sales_book_merka: salesBookMerka,
-    // Sales Book "Merka" column vs the credit_sales table. They should match;
+    // Sales Book credit column (stored as merka_wood_ghs, now the total of
+    // ALL creditors) vs the credit_sales table. They should match;
     // a gap means one of the two was keyed wrong, and the creditor balance
     // follows credit_sales, not the Sales Book.
     credit_source_gap: salesBookMerka - totalCredit,
@@ -709,7 +710,7 @@ function computeBankingHealth({ salesBook, banking, month, payments, paymentsOk 
   if (salesBook.length === 0 && banking.length === 0) return { available: false, reason: 'No Sales Book or banking entries for this month.' };
   const grossSales = sumBy(salesBook, 'total_sales_ghs');
   const merka = sumBy(salesBook, 'merka_wood_ghs');
-  // Merka Wood pays its credit through the same bank/MoMo accounts, so those
+  // Creditors pay their credit through the same bank/MoMo accounts, so those
   // payments are deposits that no sale explains. On the real September data
   // banked exceeded (sales - Merka credit) by ~GHS 532k before this was added.
   const merkaPaid = paymentsOk ? sumBy(payments, 'amount_ghs') : 0;
@@ -759,7 +760,7 @@ function computeBankingHealth({ salesBook, banking, month, payments, paymentsOk 
     avg_daily_sales: avgDaily,
     threshold_ghs: threshold,
     flagged_windows: windows,
-    note: 'Deposits made early next month for the last days of this month are not in this month, and early-month deposits may belong to last month. Every Merka Wood payment is assumed to be deposited; a payment kept as cash would show as a shortfall.',
+    note: 'Deposits made early next month for the last days of this month are not in this month, and early-month deposits may belong to last month. Every creditor payment is assumed to be deposited; a payment kept as cash would show as a shortfall.',
   };
 }
 
@@ -893,7 +894,7 @@ function buildExtraFlags({ variance, creditorExposure, banking, meterChecks, isC
     }
   });
   if (Math.abs(creditorExposure.credit_source_gap) > 1) {
-    flags.push({ severity: 'warning', message: `Sales Book Merka Wood column (GHS ${d(creditorExposure.sales_book_merka)}) differs from recorded credit sales (GHS ${d(creditorExposure.total_credit_sales)}) by GHS ${d(Math.abs(creditorExposure.credit_source_gap))} - one was keyed wrong. See Section 11.` });
+    flags.push({ severity: 'warning', message: `Sales Book credit column (GHS ${d(creditorExposure.sales_book_merka)}) differs from recorded credit sales (GHS ${d(creditorExposure.total_credit_sales)}) by GHS ${d(Math.abs(creditorExposure.credit_source_gap))} - one was keyed wrong. See Section 11.` });
   }
   if (banking && banking.available && banking.flagged_windows.length > 0) {
     const w = banking.flagged_windows[0];
@@ -996,7 +997,7 @@ router.get('/:month', authenticate, adminOrManager, async (req, res) => {
       assembleReport(req.supabaseAdmin, month),
       assembleReport(req.supabaseAdmin, prevMonth),
       // creditors / compliance_certificates / creditor_payments all carry deleted_at — filtered.
-      req.supabaseAdmin.from('creditors').select('id, name, current_balance_ghs, credit_limit_ghs').eq('is_active', true).is('deleted_at', null),
+      req.supabaseAdmin.from('creditors').select('id, name, current_balance_ghs, credit_limit_ghs, is_active').is('deleted_at', null),
       req.supabaseAdmin.from('compliance_certificates').select('certificate_name, issuing_authority, expiry_date, alert_days_before, status').is('deleted_at', null),
       // tanker_deliveries has NO deleted_at column — do not add that filter.
       req.supabaseAdmin.from('tanker_deliveries').select('delivery_date, fuel_type, tank_id, expected_litres, actual_litres, shortage_litres').gte('delivery_date', startDate).lte('delivery_date', endDate),

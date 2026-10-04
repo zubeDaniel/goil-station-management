@@ -80,6 +80,26 @@ async function deriveMeterAmount(supabaseAdmin, entryDate) {
   return grossAmount - rttValue;
 }
 
+// Derive the day's credit total from credit_sales itself, for the same
+// reason meter_amount_ghs is derived above: the Sales Book must not be able
+// to disagree with the Creditors module about how much was sold on credit.
+// The stored column is still called merka_wood_ghs (it feeds the generated
+// total_sales_ghs / variance_ghs columns, and renaming it would mean
+// rewriting those), but it now holds ALL creditors' credit sales for the
+// date, summed. The per-creditor split is read live from credit_sales by the
+// UI and the reports, so there is exactly one place each creditor's figure
+// is stored.
+async function deriveCreditTotal(supabaseAdmin, entryDate) {
+  const { data, error } = await supabaseAdmin
+    .from('credit_sales')
+    .select('total_amount_ghs')
+    .eq('sale_date', entryDate)
+    .is('deleted_at', null);
+  if (error) throw new Error(`Failed to derive credit total: ${error.message}`);
+  const total = (data || []).reduce((sum, r) => sum + (parseFloat(r.total_amount_ghs) || 0), 0);
+  return Math.round(total * 100) / 100;
+}
+
 // GET /api/sales
 router.get('/', authenticate, adminOrManager, async (req, res) => {
   try {
@@ -105,7 +125,7 @@ router.post('/', authenticate, adminOrManager, async (req, res) => {
   try {
     const {
       entry_date, coupons_ghs, gocard_ghs,
-      momo_ghs, merka_wood_ghs, genset_ghs,
+      momo_ghs, genset_ghs,
       lubricant_ghs, physical_cash_ghs
     } = req.body;
 
@@ -115,7 +135,7 @@ router.post('/', authenticate, adminOrManager, async (req, res) => {
     // This table is cross-checked against meter_amount_ghs specifically to
     // catch reporting mismatches — a negative channel value would defeat
     // that check silently instead of surfacing a real variance.
-    for (const [field, value] of Object.entries({ coupons_ghs, gocard_ghs, momo_ghs, merka_wood_ghs, genset_ghs, lubricant_ghs, physical_cash_ghs })) {
+    for (const [field, value] of Object.entries({ coupons_ghs, gocard_ghs, momo_ghs, genset_ghs, lubricant_ghs, physical_cash_ghs })) {
       if (value !== undefined && (!Number.isFinite(Number(value)) || Number(value) < 0)) {
         return res.status(400).json({ error: `${field} must be a non-negative number` });
       }
@@ -125,6 +145,9 @@ router.post('/', authenticate, adminOrManager, async (req, res) => {
     }
 
     const meterAmountGhs = await deriveMeterAmount(req.supabaseAdmin, entry_date);
+    // merka_wood_ghs from the request body is ignored on purpose — see
+    // deriveCreditTotal().
+    const creditTotalGhs = await deriveCreditTotal(req.supabaseAdmin, entry_date);
 
     // RTT is NEVER accepted as input here. meter_amount_ghs is never
     // accepted from the client either — see deriveMeterAmount() above.
@@ -140,7 +163,7 @@ router.post('/', authenticate, adminOrManager, async (req, res) => {
         coupons_ghs: coupons_ghs || 0,
         gocard_ghs: gocard_ghs || 0,
         momo_ghs: momo_ghs || 0,
-        merka_wood_ghs: merka_wood_ghs || 0,
+        merka_wood_ghs: creditTotalGhs,
         genset_ghs: genset_ghs || 0,
         lubricant_ghs: lubricant_ghs || 0,
         physical_cash_ghs: physical_cash_ghs || 0,
@@ -167,7 +190,7 @@ router.put('/:id', authenticate, adminOrManager, async (req, res) => {
   try {
     const {
       coupons_ghs, gocard_ghs,
-      momo_ghs, merka_wood_ghs, genset_ghs,
+      momo_ghs, genset_ghs,
       lubricant_ghs, physical_cash_ghs
     } = req.body;
 
@@ -184,13 +207,14 @@ router.put('/:id', authenticate, adminOrManager, async (req, res) => {
       return res.status(404).json({ error: 'Sales entry not found' });
     }
 
-    for (const [field, value] of Object.entries({ coupons_ghs, gocard_ghs, momo_ghs, merka_wood_ghs, genset_ghs, lubricant_ghs, physical_cash_ghs })) {
+    for (const [field, value] of Object.entries({ coupons_ghs, gocard_ghs, momo_ghs, genset_ghs, lubricant_ghs, physical_cash_ghs })) {
       if (value !== undefined && (!Number.isFinite(Number(value)) || Number(value) < 0)) {
         return res.status(400).json({ error: `${field} must be a non-negative number` });
       }
     }
 
     const meterAmountGhs = await deriveMeterAmount(req.supabaseAdmin, existing.entry_date);
+    const creditTotalGhs = await deriveCreditTotal(req.supabaseAdmin, existing.entry_date);
 
     const { data, error } = await req.supabaseAdmin
       .from('sales_book')
@@ -198,7 +222,7 @@ router.put('/:id', authenticate, adminOrManager, async (req, res) => {
         coupons_ghs: coupons_ghs || 0,
         gocard_ghs: gocard_ghs || 0,
         momo_ghs: momo_ghs || 0,
-        merka_wood_ghs: merka_wood_ghs || 0,
+        merka_wood_ghs: creditTotalGhs,
         genset_ghs: genset_ghs || 0,
         lubricant_ghs: lubricant_ghs || 0,
         physical_cash_ghs: physical_cash_ghs || 0,

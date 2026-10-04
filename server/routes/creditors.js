@@ -37,6 +37,73 @@ router.post('/', authenticate, adminOrManager, async (req, res) => {
   }
 });
 
+// PUT /api/creditors/:id/deactivate
+// For a creditor who has left. Deliberately refuses while a balance is
+// still owed: Reports' creditor-exposure section and the credit-limit
+// flags are built from creditors, so hiding someone who still owes money
+// would quietly take a real receivable out of view. Clear the balance
+// first (record the payment), then deactivate. History is untouched —
+// this only flips is_active; past credit sales and payments stay exactly
+// where they are, and the creditor can be reactivated.
+router.put('/:id/deactivate', authenticate, adminOrManager, async (req, res) => {
+  try {
+    const { data: creditor, error: fetchError } = await req.supabaseAdmin
+      .from('creditors')
+      .select('id, name, is_active, current_balance_ghs')
+      .eq('id', req.params.id)
+      .is('deleted_at', null)
+      .maybeSingle();
+    if (fetchError) return res.status(500).json({ error: fetchError.message });
+    if (!creditor) return res.status(404).json({ error: 'Creditor not found' });
+    if (creditor.is_active === false) {
+      return res.status(409).json({ error: `${creditor.name} is already inactive` });
+    }
+    const balance = parseFloat(creditor.current_balance_ghs) || 0;
+    if (balance > 0.005) {
+      return res.status(400).json({
+        error: `${creditor.name} still owes GHS ${balance.toFixed(2)}. Record the payment first, then deactivate.`
+      });
+    }
+
+    // The balance condition is repeated on the UPDATE itself so a credit
+    // sale landing between the check above and this write can't slip a
+    // non-zero balance past it.
+    const { data, error } = await req.supabaseAdmin
+      .from('creditors')
+      .update({ is_active: false })
+      .eq('id', req.params.id)
+      .is('deleted_at', null)
+      .lte('current_balance_ghs', 0.005)
+      .select()
+      .maybeSingle();
+    if (error) return res.status(500).json({ error: error.message });
+    if (!data) {
+      return res.status(409).json({ error: `${creditor.name}'s balance changed while deactivating — refresh and try again.` });
+    }
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to deactivate creditor' });
+  }
+});
+
+// PUT /api/creditors/:id/reactivate
+router.put('/:id/reactivate', authenticate, adminOrManager, async (req, res) => {
+  try {
+    const { data, error } = await req.supabaseAdmin
+      .from('creditors')
+      .update({ is_active: true })
+      .eq('id', req.params.id)
+      .is('deleted_at', null)
+      .select()
+      .maybeSingle();
+    if (error) return res.status(500).json({ error: error.message });
+    if (!data) return res.status(404).json({ error: 'Creditor not found' });
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to reactivate creditor' });
+  }
+});
+
 // GET /api/creditors/credit-sales
 router.get('/credit-sales', authenticate, adminOrManager, async (req, res) => {
   try {
@@ -80,6 +147,21 @@ router.post('/credit-sales', authenticate, adminOrManager, async (req, res) => {
     }
     if (dxp_litres !== undefined && (!Number.isFinite(Number(dxp_litres)) || Number(dxp_litres) < 0)) {
       return res.status(400).json({ error: 'dxp_litres must be a non-negative number' });
+    }
+
+    // A deactivated creditor has left — a new sale to them is almost
+    // certainly the wrong creditor picked in the dropdown. Editing or
+    // reversing their OLD sales still works (separate routes below).
+    const { data: targetCreditor, error: creditorError } = await req.supabaseAdmin
+      .from('creditors')
+      .select('name, is_active')
+      .eq('id', creditor_id)
+      .is('deleted_at', null)
+      .maybeSingle();
+    if (creditorError) return res.status(500).json({ error: creditorError.message });
+    if (!targetCreditor) return res.status(404).json({ error: 'Creditor not found' });
+    if (targetCreditor.is_active === false) {
+      return res.status(400).json({ error: `${targetCreditor.name} is inactive. Reactivate them first, or pick a different creditor.` });
     }
 
     // Recompute amounts server-side using the price effective on sale_date —
@@ -227,6 +309,24 @@ router.put('/credit-sales/:id', authenticate, adminOrManager, async (req, res) =
     }
     if (dxp_litres !== undefined && (!Number.isFinite(Number(dxp_litres)) || Number(dxp_litres) < 0)) {
       return res.status(400).json({ error: 'dxp_litres must be a non-negative number' });
+    }
+
+    // edit_credit_sale() cannot change a sale's creditor (reassigning is
+    // reverse-and-re-enter, by design). If a caller sends a different
+    // creditor_id, silently ignoring it would answer "updated" while the sale
+    // stays with the old creditor — so refuse it instead.
+    if (req.body.creditor_id) {
+      const { data: existingSale, error: lookupError } = await req.supabaseAdmin
+        .from('credit_sales')
+        .select('creditor_id')
+        .eq('id', req.params.id)
+        .is('deleted_at', null)
+        .maybeSingle();
+      if (lookupError) return res.status(500).json({ error: lookupError.message });
+      if (!existingSale) return res.status(404).json({ error: 'Credit sale not found' });
+      if (existingSale.creditor_id !== req.body.creditor_id) {
+        return res.status(400).json({ error: "A credit sale can't be moved to a different creditor by editing it. Reverse it, then enter a new sale for the right creditor." });
+      }
     }
 
     // Same server-side effective-price recomputation as POST — never

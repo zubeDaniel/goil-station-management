@@ -302,7 +302,7 @@ export default function Reports() {
         ['SXP Litres', fmtL(totalSXP), totalSXP, 'total_sxp_litres'],
         ['DXP Litres', fmtL(totalDXP), totalDXP, 'total_dxp_litres'],
         ['Total Banked', `GHS ${fmt(totalBanked)}`, totalBanked, 'total_banked'],
-        ['Merka Wood Credit Sales', `GHS ${fmt(totalCredit)}`, totalCredit, 'total_credit'],
+        ['Credit Sales (all creditors)', `GHS ${fmt(totalCredit)}`, totalCredit, 'total_credit'],
         ['Dealer Earnings', `GHS ${fmt(dealerEarnings)}`, dealerEarnings, 'dealer_earnings'],
         ['Total Expenses', `GHS ${fmt(totalExpenses)}`, totalExpenses, 'total_expenses'],
         ['Net Dealer Profit', `GHS ${fmt(netDealerProfit)}`, netDealerProfit, 'net_dealer_profit'],
@@ -598,7 +598,7 @@ export default function Reports() {
       doc.text('SECTION 2 — SALES BOOK', ml + 6, y + 2)
       y += 12
 
-      const s2Headers = ['Date', 'Cash', 'Coupons', 'GoCard', 'MoMo', 'Merka', 'Genset', 'Lubricant', 'Total']
+      const s2Headers = ['Date', 'Cash', 'Coupons', 'GoCard', 'MoMo', 'Credit', 'Genset', 'Lubricant', 'Total']
       const s2Widths = [20, 20, 18, 18, 18, 20, 16, 16, 34]
       doc.setFillColor(...ASH)
       doc.rect(ml, y - 4, cw, 7, 'F')
@@ -701,11 +701,16 @@ export default function Reports() {
       doc.setTextColor(...WHITE)
       doc.setFontSize(10)
       doc.setFont('helvetica', 'bold')
-      doc.text('SECTION 4 — MERKA WOOD CREDIT SALES', ml + 6, y + 2)
+      doc.text('SECTION 4 — CREDIT SALES BY CREDITOR', ml + 6, y + 2)
       y += 12
 
-      const s4Headers = ['Date', 'SXP (L)', 'DXP (L)', 'SXP Amount', 'DXP Amount', 'Total']
-      const s4Widths = [25, 25, 25, 35, 35, 35]
+      const s4Headers = ['Date', 'Creditor', 'SXP (L)', 'DXP (L)', 'SXP Amount', 'DXP Amount', 'Total']
+      const s4Widths = [20, 44, 18, 18, 26, 26, 28]
+      // Two creditors can have sales on the same day; order by date, then name.
+      const s4Name = (c) => c.creditors?.name || 'Unknown'
+      const creditsSorted = [...credits].sort((a, b) => a.sale_date.localeCompare(b.sale_date) || s4Name(a).localeCompare(s4Name(b)))
+      // jsPDF's helvetica can't draw an ellipsis glyph, so truncate with '..'
+      const s4Trim = (str) => (str.length > 23 ? str.slice(0, 21) + '..' : str)
       doc.setFillColor(...ASH)
       doc.rect(ml, y - 4, cw, 7, 'F')
       doc.setTextColor(...ORANGE)
@@ -716,14 +721,50 @@ export default function Reports() {
 
       doc.setTextColor(...DARK_GREY)
       doc.setFont('helvetica', 'normal')
-      credits.forEach((c, idx) => {
+      creditsSorted.forEach((c, idx) => {
         checkPage(7)
         if (idx % 2 === 0) { doc.setFillColor(...LIGHT_ASH); doc.rect(ml, y - 4, cw, 7, 'F') }
         x = ml
-        const row = [c.sale_date, fmt(c.sxp_litres), fmt(c.dxp_litres), parseFloat(c.sxp_amount_ghs) > 0 ? `GHS ${fmt(c.sxp_amount_ghs)}` : '—', `GHS ${fmt(c.dxp_amount_ghs)}`, `GHS ${fmt(c.total_amount_ghs)}`]
+        const row = [c.sale_date, s4Trim(s4Name(c)), fmt(c.sxp_litres), fmt(c.dxp_litres), parseFloat(c.sxp_amount_ghs) > 0 ? `GHS ${fmt(c.sxp_amount_ghs)}` : '—', `GHS ${fmt(c.dxp_amount_ghs)}`, `GHS ${fmt(c.total_amount_ghs)}`]
         row.forEach((cell, i) => { doc.text(String(cell), x + 1, y); x += s4Widths[i] })
         y += 7
       })
+
+      // Per-creditor totals for the month, then the all-creditor total.
+      if (credits.length > 0) {
+        const byCreditor = new Map()
+        credits.forEach(c => {
+          const key = c.creditor_id || s4Name(c)
+          const cur = byCreditor.get(key) || { name: s4Name(c), sxp: 0, dxp: 0, total: 0 }
+          cur.sxp += parseFloat(c.sxp_litres || 0)
+          cur.dxp += parseFloat(c.dxp_litres || 0)
+          cur.total += parseFloat(c.total_amount_ghs || 0)
+          byCreditor.set(key, cur)
+        })
+        const rows = [...byCreditor.values()].sort((a, b) => a.name.localeCompare(b.name))
+        checkPage(7 * (rows.length + 2))
+        y += 3
+        doc.setFont('helvetica', 'bold')
+        doc.setFontSize(8)
+        doc.setTextColor(...ORANGE)
+        doc.text('MONTH TOTAL BY CREDITOR', ml + 1, y)
+        y += 6
+        doc.setTextColor(...DARK_GREY)
+        rows.forEach(r => {
+          checkPage(7)
+          x = ml
+          const cells = ['', s4Trim(r.name), fmt(r.sxp), fmt(r.dxp), '', '', `GHS ${fmt(r.total)}`]
+          cells.forEach((cell, i) => { doc.text(String(cell), x + 1, y); x += s4Widths[i] })
+          y += 7
+        })
+        if (rows.length > 1) {
+          x = ml
+          const allCells = ['', 'All creditors', fmt(rows.reduce((a, r) => a + r.sxp, 0)), fmt(rows.reduce((a, r) => a + r.dxp, 0)), '', '', `GHS ${fmt(rows.reduce((a, r) => a + r.total, 0))}`]
+          allCells.forEach((cell, i) => { doc.text(String(cell), x + 1, y); x += s4Widths[i] })
+          y += 7
+        }
+        doc.setFont('helvetica', 'normal')
+      }
 
       if (credits.length === 0) {
         doc.setTextColor(...MID_GREY)
@@ -1076,7 +1117,7 @@ export default function Reports() {
           paragraph('Balances could not be rebuilt for this report.', { size: 8, color: AMBER_TXT })
         }
         if (Math.abs(ce.credit_source_gap) > 1) {
-          callout(`The Sales Book Merka Wood column totals GHS ${fmt(ce.sales_book_merka)} but recorded credit sales total GHS ${fmt(ce.total_credit_sales)} (difference GHS ${fmt(Math.abs(ce.credit_source_gap))}). One of them was keyed wrong; creditor balances follow the credit sales.`, 'warning')
+          callout(`The Sales Book credit column totals GHS ${fmt(ce.sales_book_merka)} but recorded credit sales total GHS ${fmt(ce.total_credit_sales)} (difference GHS ${fmt(Math.abs(ce.credit_source_gap))}). One of them was keyed wrong; creditor balances follow the credit sales.`, 'warning')
         }
         paragraph(`Credit sales were ${pctTxt(ce.credit_share_of_revenue_pct)} of total revenue (GHS ${fmt(ce.total_credit_sales)}; revenue basis: ${ce.revenue_basis}).`, { size: 8.5 })
         footnote('Net change = credit sales - payments received in the month. Month-end balance is rebuilt from today\'s balance by undoing everything recorded after the month; opening = month-end - net change. Both are estimates: the system clamps balances at zero, so an overpayment makes them slightly off.')
@@ -1092,8 +1133,8 @@ export default function Reports() {
         const ba = ['l', 'r']
         tableHead(['Item', 'GHS'], bw, ba)
         tableRow(['Sales Book total (all channels, Section 2)', fmt(bh.gross_sales)], bw, ba, { idx: 0 })
-        tableRow(['Less: Merka Wood credit (not banked)', `-${fmt(bh.merka_credit)}`], bw, ba, { idx: 1 })
-        tableRow([bh.payments_available ? 'Add: Merka Wood payments received (banked later)' : 'Add: Merka Wood payments (could not be loaded)', bh.payments_available ? `+${fmt(bh.merka_payments)}` : 'n/a'], bw, ba, { idx: 2 })
+        tableRow(['Less: Credit sales (not banked)', `-${fmt(bh.merka_credit)}`], bw, ba, { idx: 1 })
+        tableRow([bh.payments_available ? 'Add: Creditor payments received (banked later)' : 'Add: Creditor payments (could not be loaded)', bh.payments_available ? `+${fmt(bh.merka_payments)}` : 'n/a'], bw, ba, { idx: 2 })
         tableRow(['Expected to be banked', fmt(bh.expected_banked)], bw, ba, { idx: 3, bold: true })
         tableRow(['Total banked (Section 3)', fmt(bh.total_banked)], bw, ba, { idx: 4, bold: true })
         tableRow([bh.gap > 0.005 ? 'Banked LESS than expected by' : 'Banked MORE than expected by', fmt(Math.abs(bh.gap))], bw, ba, { idx: 5, bold: true, colors: [DARK_GREY, bh.gap > 0.005 ? RED : GREEN] })
@@ -1103,7 +1144,7 @@ export default function Reports() {
         } else {
           bh.flagged_windows.forEach(w => callout(`Banking lagged sales from ${w.from} to ${w.to} (${w.days} days): the running gap stayed above one day of average sales (GHS ${fmt(bh.threshold_ghs)}), peaking at GHS ${fmt(w.peak_gap_ghs)}.`, 'warning'))
         }
-        footnote(`Method: running (sales - Merka Wood credit) minus running banked, day by day, on business dates; flagged when above one day of average sales for more than 2 consecutive days. ${bh.note}`)
+        footnote(`Method: running (sales - credit sales) minus running banked, day by day, on business dates; flagged when above one day of average sales for more than 2 consecutive days. ${bh.note}`)
       }
 
       // ── SECTION 13: NOZZLE AND METER CHECKS ────────────
@@ -1201,7 +1242,7 @@ export default function Reports() {
     { key: 's1', label: 'Section 1', title: 'Fuel Sales' },
     { key: 's2', label: 'Section 2', title: 'Sales Book' },
     { key: 's3', label: 'Section 3', title: 'Banking' },
-    { key: 's4', label: 'Section 4', title: 'Merka Wood' },
+    { key: 's4', label: 'Section 4', title: 'Credit Sales' },
     { key: 's5', label: 'Section 5', title: 'Consolidated' },
     { key: 's6', label: 'Section 6', title: 'Stock Movement' },
     { key: 's7', label: 'Section 7', title: 'Dealer Margin' },
@@ -1361,7 +1402,7 @@ export default function Reports() {
               <div className="table-wrap">
                 <table>
                   <thead>
-                    <tr><th>Date</th><th>Cash</th><th>Coupons</th><th>GoCard</th><th>MoMo</th><th>Merka</th><th>Genset</th><th>Lubricant</th><th>Total</th><th>Variance</th></tr>
+                    <tr><th>Date</th><th>Cash</th><th>Coupons</th><th>GoCard</th><th>MoMo</th><th>Credit</th><th>Genset</th><th>Lubricant</th><th>Total</th><th>Variance</th></tr>
                   </thead>
                   <tbody>
                     {report.section2_sales_book.map(s => (
@@ -1448,16 +1489,19 @@ export default function Reports() {
           {/* Section 4 */}
           {activeSection === 's4' && (
             <div className="card">
-              <div className="card-header"><div className="card-title">Section 4 — Merka Wood Credit Sales</div></div>
+              <div className="card-header"><div className="card-title">Section 4 — Credit Sales by Creditor</div></div>
               <div className="table-wrap">
                 <table>
                   <thead>
-                    <tr><th>Date</th><th>SXP (L)</th><th>DXP (L)</th><th>SXP amt</th><th>DXP amt</th><th>Total</th></tr>
+                    <tr><th>Date</th><th>Creditor</th><th>SXP (L)</th><th>DXP (L)</th><th>SXP amt</th><th>DXP amt</th><th>Total</th></tr>
                   </thead>
                   <tbody>
-                    {report.section4_credit_sales.map(cs => (
+                    {[...report.section4_credit_sales]
+                      .sort((a, b) => a.sale_date.localeCompare(b.sale_date) || (a.creditors?.name || '').localeCompare(b.creditors?.name || ''))
+                      .map(cs => (
                       <tr key={cs.id}>
                         <td>{cs.sale_date}</td>
+                        <td>{cs.creditors?.name || 'Unknown'}</td>
                         <td className="td-calc">{parseFloat(cs.sxp_litres).toFixed(2)}</td>
                         <td className="td-calc">{parseFloat(cs.dxp_litres).toFixed(2)}</td>
                         <td className="td-calc">{parseFloat(cs.sxp_amount_ghs) > 0 ? 'GHS ' + parseFloat(cs.sxp_amount_ghs).toFixed(2) : '—'}</td>
@@ -1466,11 +1510,12 @@ export default function Reports() {
                       </tr>
                     ))}
                     {report.section4_credit_sales.length === 0 && (
-                      <tr><td colSpan={6} style={{ textAlign: 'center', color: 'var(--text-3)', padding: 24 }}>No credit sales for this period</td></tr>
+                      <tr><td colSpan={7} style={{ textAlign: 'center', color: 'var(--text-3)', padding: 24 }}>No credit sales for this period</td></tr>
                     )}
                     {report.section4_credit_sales.length > 0 && (
                       <tr className="tr-total">
                         <td><strong>Total</strong></td>
+                        <td>All creditors</td>
                         <td className="td-calc"><strong>{report.section4_credit_sales.reduce((s, c) => s + parseFloat(c.sxp_litres || 0), 0).toFixed(2)} L</strong></td>
                         <td className="td-calc"><strong>{report.section4_credit_sales.reduce((s, c) => s + parseFloat(c.dxp_litres || 0), 0).toFixed(2)} L</strong></td>
                         <td></td>

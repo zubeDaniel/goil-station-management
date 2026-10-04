@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import api from '../lib/api'
 import { useToast } from '../components/Toast'
+import { buildCreditLines } from '../lib/creditLines'
 
 export default function SalesBook() {
   const { showToast } = useToast()
@@ -27,6 +28,23 @@ export default function SalesBook() {
   // once, server-side, in deriveMeterAmount() (server/routes/sales.js) —
   // duplicating a price lookup here risks it drifting out of sync.
   const [rttLitresToday, setRttLitresToday] = useState(0)
+  // Per-creditor credit lines for the selected date, derived from
+  // credit_sales (Creditors screen). Display only: the server recomputes the
+  // stored total itself on save (deriveCreditTotal(), server/routes/sales.js).
+  const [creditLines, setCreditLines] = useState([])
+  // Date the current creditLines were loaded for. "Loaded" is derived from
+  // it (below) rather than a flag that has to be reset inside the effect.
+  const [creditLinesFor, setCreditLinesFor] = useState(null)
+  // Date a credit-sales load failed for (derived the same way), plus a
+  // counter the Retry button bumps to re-run the load.
+  const [creditFailedFor, setCreditFailedFor] = useState(null)
+  const [creditReloadKey, setCreditReloadKey] = useState(0)
+  // Stored credit total of the row being edited, to flag if it no longer
+  // matches what Creditors says for that date.
+  const [editedStoredCredit, setEditedStoredCredit] = useState(null)
+
+  const creditLinesLoaded = creditLinesFor === form.entry_date
+  const creditLoadFailed = creditFailedFor === form.entry_date
 
   const startDate = `${selectedMonth}-01`
   const endDate = new Date(new Date(startDate).getFullYear(), new Date(startDate).getMonth() + 1, 0)
@@ -48,14 +66,29 @@ export default function SalesBook() {
     }
   }
 
-  // Auto-fill Merka Wood from credit sales, and meter amount from pump readings,
+  // Auto-fill the per-creditor credit lines from credit sales, and meter amount from pump readings,
   // for whichever date is selected — not just today
   useEffect(() => {
-    api.get(`/creditors/credit-sales?start_date=${form.entry_date}&end_date=${form.entry_date}`)
-      .then(res => {
-        const total = res.data.reduce((s, cs) => s + parseFloat(cs.total_amount_ghs || 0), 0)
-        setForm(p => ({ ...p, merka_wood_ghs: total.toFixed(2) }))
-      }).catch(() => {})
+    // `cancelled` stops a slow response for a previous date from landing
+    // after the user has already moved to another one.
+    let cancelled = false
+    Promise.all([
+      api.get('/creditors'),
+      api.get(`/creditors/credit-sales?start_date=${form.entry_date}&end_date=${form.entry_date}`),
+    ]).then(([cRes, csRes]) => {
+      if (cancelled) return
+      const { lines, total } = buildCreditLines(cRes.data, csRes.data)
+      setCreditLines(lines)
+      setCreditLinesFor(form.entry_date)
+      setForm(p => ({ ...p, merka_wood_ghs: total.toFixed(2) }))
+    }).catch(() => {
+      if (cancelled) return
+      // Surface it in the field (with a Retry button), rather than leaving it
+      // on "Loading..." forever. The server works out the credit total itself when saving, so this only
+      // affects the preview — saving stays possible.
+      setCreditFailedFor(form.entry_date)
+      setForm(p => ({ ...p, merka_wood_ghs: '0' }))
+    })
 
     // meter_amount_ghs here is a client-side preview, recomputed
     // authoritatively server-side at save time — that server figure is
@@ -82,10 +115,12 @@ export default function SalesBook() {
           const impliedPrice = parseFloat(r.amount_ghs || 0) / litres
           return s + rtt * impliedPrice
         }, 0)
+        if (cancelled) return
         setForm(p => ({ ...p, meter_amount_ghs: (gross - rttValue).toFixed(2) }))
         setRttLitresToday(rttLitres)
       }).catch(() => {})
-  }, [form.entry_date])
+    return () => { cancelled = true }
+  }, [form.entry_date, creditReloadKey])
 
   const emptyForm = () => ({
     entry_date: new Date().toISOString().split('T')[0],
@@ -96,12 +131,20 @@ export default function SalesBook() {
   })
 
   const handleSave = async () => {
+    // Only block while the load is still in flight. If it FAILED, saving is
+    // still correct (the server derives the credit total), so don't lock the
+    // whole day's entry behind a preview request.
+    if (!creditLinesLoaded && !creditLoadFailed) {
+      showToast('error', 'Credit sales still loading', 'Wait a moment, then save again')
+      return
+    }
     setSaving(true)
     try {
       if (editingId) {
         await api.put(`/sales/${editingId}`, form)
         showToast('success', 'Sales entry updated', form.entry_date)
         setEditingId(null)
+        setEditedStoredCredit(null)
       } else {
         await api.post('/sales', form)
         showToast('success', 'Sales entry saved', form.entry_date)
@@ -117,13 +160,19 @@ export default function SalesBook() {
 
   const handleEdit = (row) => {
     setEditingId(row.id)
+    setEditedStoredCredit(parseFloat(row.merka_wood_ghs || 0))
     setForm({
       entry_date: row.entry_date,
       physical_cash_ghs: String(row.physical_cash_ghs || 0),
       coupons_ghs: String(row.coupons_ghs || 0),
       gocard_ghs: String(row.gocard_ghs || 0),
       momo_ghs: String(row.momo_ghs || 0),
-      merka_wood_ghs: String(row.merka_wood_ghs || 0),
+      // If this is already the selected date the date effect won't re-run,
+      // so take the live Creditors total now; otherwise the effect sets it
+      // as soon as the new date's credit sales load.
+      merka_wood_ghs: row.entry_date === form.entry_date
+        ? creditLines.reduce((sum, l) => sum + l.amount, 0).toFixed(2)
+        : String(row.merka_wood_ghs || 0),
       genset_ghs: String(row.genset_ghs || 0),
       lubricant_ghs: String(row.lubricant_ghs || 0),
       meter_amount_ghs: String(row.meter_amount_ghs || 0),
@@ -133,6 +182,7 @@ export default function SalesBook() {
 
   const handleCancelEdit = () => {
     setEditingId(null)
+    setEditedStoredCredit(null)
     setForm(emptyForm())
   }
 
@@ -153,7 +203,7 @@ export default function SalesBook() {
     { key: 'coupons_ghs', label: 'Coupons', hint: 'Revenue from coupon sales today — separate from Banking\'s coupon deposit, which reconciles against this' },
     { key: 'gocard_ghs', label: 'GoCard' },
     { key: 'momo_ghs', label: 'MoMo' },
-    { key: 'merka_wood_ghs', label: 'Merka Wood', auto: true },
+    { key: 'merka_wood_ghs', label: 'Credit sales', credit: true },
     { key: 'genset_ghs', label: 'Genset' },
     { key: 'lubricant_ghs', label: 'Lubricant' },
   ]
@@ -167,6 +217,7 @@ export default function SalesBook() {
     return acc
   }, {})
   const monthlyTotal = sales.reduce((s, row) => s + parseFloat(row.total_sales_ghs || 0), 0)
+
 
   // Available months
   const months = []
@@ -215,7 +266,7 @@ export default function SalesBook() {
             {editingId && <span className="form-hint">Date can't be changed while editing — delete and re-create instead</span>}
           </div>
           <div className="form-row">
-            {channels.map(ch => (
+            {channels.filter(ch => !ch.credit).map(ch => (
               <div key={ch.key} className="form-group">
                 <label className="form-label">{ch.label} (GHS)</label>
                 <input
@@ -230,6 +281,28 @@ export default function SalesBook() {
               </div>
             ))}
           </div>
+          {/* Credit sales — ONE auto-filled figure: every creditor's credit
+              for the day, added up from the Creditors screen. */}
+          <div className="form-group" style={{ marginBottom: 14, maxWidth: 220 }}>
+            <label className="form-label">Credit sales (GHS)</label>
+            <input className="form-input is-auto" value={creditLinesLoaded ? (parseFloat(form.merka_wood_ghs) || 0).toFixed(2) : creditLoadFailed ? 'Not loaded' : 'Loading...'} readOnly />
+            {creditLoadFailed ? (
+              <span className="form-error">
+                Couldn't load credit sales — totals above exclude credit (saving still adds it).{' '}
+                <button type="button" className="btn btn-ghost btn-sm" onClick={() => { setCreditFailedFor(null); setCreditReloadKey(k => k + 1) }}>Retry</button>
+              </span>
+            ) : (
+              <span className="form-hint">All creditors, from Creditors screen</span>
+            )}
+          </div>
+          {editingId && creditLinesLoaded && editedStoredCredit !== null && Math.abs(editedStoredCredit - (parseFloat(form.merka_wood_ghs) || 0)) >= 0.005 && (
+            <div className="alert alert-warning" style={{ marginBottom: 14 }}>
+              <div className="alert-body">
+                <div className="alert-title">This entry's credit total differs from Creditors</div>
+                <div className="alert-desc">Saved: GHS {editedStoredCredit.toFixed(2)} &middot; Creditors now says: GHS {(parseFloat(form.merka_wood_ghs) || 0).toFixed(2)}. Saving will update the entry to the Creditors figure.</div>
+              </div>
+            </div>
+          )}
           <div className="form-group" style={{ marginBottom: 14, maxWidth: 220 }}>
             <label className="form-label">Meter amount (GHS)</label>
             <input className="form-input is-auto" type="number" value={form.meter_amount_ghs}
@@ -323,7 +396,7 @@ export default function SalesBook() {
             <thead>
               <tr>
                 <th>Date</th><th>Cash</th><th>Coupons</th><th>GoCard</th><th>MoMo</th>
-                <th>Merka</th><th>Genset</th><th>Lubricant</th>
+                <th>Credit</th><th>Genset</th><th>Lubricant</th>
                 <th>Total sales</th><th>Meter amt</th><th>Variance</th><th>Actions</th>
               </tr>
             </thead>

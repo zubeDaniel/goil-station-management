@@ -50,10 +50,18 @@ export default function Creditors() {
       setCreditors(cRes.data)
       setCreditSales(csRes.data)
       setPrices(pRes.data)
-      if (cRes.data.length > 0) {
-        setSaleForm(p => ({ ...p, creditor_id: cRes.data[0].id }))
-        setSelectedCreditor(cRes.data[0])
-      }
+      // Keep whichever creditor the user already had selected. This used to
+      // reset to the first creditor on every reload — including right after
+      // saving a sale — so with two creditors the next sale quietly defaulted
+      // to whoever sorts first, and was easy to record against the wrong one.
+      // The selected object is re-resolved from the fresh list so its balance
+      // updates too.
+      const active = cRes.data.filter(c => c.is_active !== false)
+      setSelectedCreditor(prev => cRes.data.find(c => c.id === prev?.id) || active[0] || null)
+      setSaleForm(p => ({
+        ...p,
+        creditor_id: active.some(c => c.id === p.creditor_id) ? p.creditor_id : (active[0]?.id || '')
+      }))
     } catch (err) {
       console.error(err)
     } finally {
@@ -130,6 +138,31 @@ export default function Creditors() {
       showToast('error', 'Save failed', err.response?.data?.error)
     } finally {
       setSaving(false)
+    }
+  }
+
+  const handleDeactivateCreditor = async (c) => {
+    if (!confirm(`Deactivate ${c.name}? They will no longer appear when recording credit sales. Their history stays, and you can reactivate them later.`)) return
+    try {
+      await api.put(`/creditors/${c.id}/deactivate`)
+      showToast('success', 'Creditor deactivated', c.name)
+      // loadData() keeps the current selection if it still exists, and an
+      // inactive creditor still "exists" — so clear it first, otherwise the
+      // credit-history panel keeps showing the creditor who just left.
+      setSelectedCreditor(prev => (prev?.id === c.id ? null : prev))
+      await loadData()
+    } catch (err) {
+      showToast('error', 'Could not deactivate', err.response?.data?.error)
+    }
+  }
+
+  const handleReactivateCreditor = async (c) => {
+    try {
+      await api.put(`/creditors/${c.id}/reactivate`)
+      showToast('success', 'Creditor reactivated', c.name)
+      await loadData()
+    } catch (err) {
+      showToast('error', 'Could not reactivate', err.response?.data?.error)
     }
   }
 
@@ -265,6 +298,16 @@ export default function Creditors() {
     : creditSales
 
   const monthTotal = filteredSales.reduce((s, cs) => s + parseFloat(cs.total_amount_ghs || 0), 0)
+
+  const activeCreditors = creditors.filter(c => c.is_active !== false)
+  const inactiveCreditors = creditors.filter(c => c.is_active === false)
+  // A sale being edited can belong to a creditor who has since been
+  // deactivated; keep them in the dropdown for that edit only.
+  const saleCreditorOptions = [
+    ...activeCreditors,
+    ...inactiveCreditors.filter(c => c.id === saleForm.creditor_id)
+  ]
+  const saleCreditorName = creditors.find(c => c.id === saleForm.creditor_id)?.name
 
   if (loading) return <div className="loading-screen">Loading creditors...</div>
 
@@ -416,7 +459,7 @@ export default function Creditors() {
       <div className="grid-2 mb-16">
         {/* Creditor cards */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-          {creditors.map(c => (
+          {activeCreditors.map(c => (
             <div key={c.id} className="card" style={{ cursor: 'pointer', borderColor: selectedCreditor?.id === c.id ? 'var(--navy-border)' : 'var(--border)' }}
               onClick={() => { setSelectedCreditor(c); setSaleForm(p => ({ ...p, creditor_id: c.id })) }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 16 }}>
@@ -447,13 +490,37 @@ export default function Creditors() {
                   <i className="ph ph-check"></i> Record payment
                 </button>
                 <button className="btn btn-ghost btn-sm" onClick={e => { e.stopPropagation(); openStatement(c) }}><i className="ph ph-file-text"></i> Statement</button>
+                <button className="btn btn-ghost btn-sm" style={{ marginLeft: 'auto', color: parseFloat(c.current_balance_ghs) > 0 ? 'var(--text-3)' : 'var(--red)' }}
+                  disabled={parseFloat(c.current_balance_ghs) > 0}
+                  title={parseFloat(c.current_balance_ghs) > 0 ? 'Clear the balance first — record the payment, then deactivate' : 'Deactivate — for a creditor who has left'}
+                  onClick={e => { e.stopPropagation(); handleDeactivateCreditor(c) }}>
+                  <i className="ph ph-user-minus"></i> Deactivate
+                </button>
               </div>
             </div>
           ))}
-          {creditors.length === 0 && (
+          {activeCreditors.length === 0 && (
             <div className="card" style={{ textAlign: 'center', padding: 32 }}>
               <i className="ph ph-users-three" style={{ fontSize: 32, color: 'var(--text-3)', display: 'block', marginBottom: 12 }}></i>
-              <div style={{ fontSize: 13, color: 'var(--text-3)' }}>No creditors yet. Add one above.</div>
+              <div style={{ fontSize: 13, color: 'var(--text-3)' }}>No active creditors. Add one above.</div>
+            </div>
+          )}
+          {inactiveCreditors.length > 0 && (
+            <div className="card">
+              <div className="card-header"><div className="card-title">Inactive creditors</div><span className="badge badge-neutral">{inactiveCreditors.length}</span></div>
+              {inactiveCreditors.map(c => (
+                <div key={c.id} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 0', borderBottom: '1px solid var(--border)' }}>
+                  <span style={{ flex: 1, fontSize: 13, color: 'var(--text-2)' }}>{c.name}</span>
+                  {parseFloat(c.current_balance_ghs) > 0 && (
+                    <>
+                      <span className="badge badge-red">Owes GHS {parseFloat(c.current_balance_ghs).toLocaleString()}</span>
+                      <button className="btn btn-primary btn-sm" onClick={() => { setSelectedCreditor(c); setShowPayment(true) }}><i className="ph ph-check"></i> Record payment</button>
+                    </>
+                  )}
+                  <button className="btn btn-ghost btn-sm" onClick={() => openStatement(c)}><i className="ph ph-file-text"></i> Statement</button>
+                  <button className="btn btn-ghost btn-sm" onClick={() => handleReactivateCreditor(c)}><i className="ph ph-user-plus"></i> Reactivate</button>
+                </div>
+              ))}
             </div>
           )}
         </div>
@@ -471,9 +538,10 @@ export default function Creditors() {
             </div>
             <div className="form-group">
               <label className="form-label">Creditor</label>
-              <select className="form-select" value={saleForm.creditor_id} onChange={e => setSaleForm(p => ({ ...p, creditor_id: e.target.value }))}>
-                {creditors.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+              <select className="form-select" value={saleForm.creditor_id} disabled={!!editingSaleId} onChange={e => setSaleForm(p => ({ ...p, creditor_id: e.target.value }))}>
+                {saleCreditorOptions.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
               </select>
+              {editingSaleId && <span className="form-hint">A sale can't be moved to another creditor by editing. To fix the creditor: reverse it, then enter it again.</span>}
             </div>
           </div>
           <div className="form-row">
@@ -497,7 +565,7 @@ export default function Creditors() {
             </div>
           </div>
           <div style={{ background: 'var(--navy-light)', border: '1px solid var(--navy-border)', borderRadius: 'var(--r-sm)', padding: '10px 12px', marginBottom: 12, display: 'flex', justifyContent: 'space-between', fontSize: 13, fontWeight: 600, color: 'var(--navy)' }}>
-            <span>Total amount</span>
+            <span>Total amount{saleCreditorName ? ` — ${saleCreditorName}` : ''}</span>
             <span className="td-calc">GHS {totalSale.toFixed(2)}</span>
           </div>
           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
