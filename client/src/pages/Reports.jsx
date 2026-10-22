@@ -2,6 +2,20 @@ import { useState, Fragment } from 'react'
 import api from '../lib/api'
 import { useToast } from '../components/Toast'
 
+// Section 3 NIB / UMB cell: a normal day shows one amount; a day banked in
+// several deposits lists each amount on its own line with the day's sum below.
+// (Slip references stay on the Banking screen — the report cells are too narrow.)
+function renderDepositCell(deposits, total) {
+  const amt = (n) => (parseFloat(n) || 0).toFixed(2)
+  if (!deposits || deposits.length <= 1) return amt(total)
+  return (
+    <div>
+      {deposits.map((d, i) => <div key={i}>{amt(d.amount_ghs)}</div>)}
+      <div style={{ borderTop: '1px solid var(--border)', marginTop: 3, paddingTop: 3, fontWeight: 700 }}>{amt(total)}</div>
+    </div>
+  )
+}
+
 // GHS currency formatter — shared by the in-app screen and the PDF export.
 // Previously this was re-declared locally inside handleExportPDF (as
 // `fmt`) and, separately, as eight inline `.toLocaleString(undefined, {
@@ -673,13 +687,36 @@ export default function Reports() {
 
       doc.setTextColor(...DARK_GREY)
       doc.setFont('helvetica', 'normal')
+      // A day banked in several NIB / UMB deposits lists each amount on its own
+      // line inside that cell with the day's sum beneath (bold), so the row grows.
+      // A single-deposit day is exactly the old one-line row (7 high).
+      const s3Cell = (deps, total) => (deps && deps.length > 1)
+        ? { lines: deps.map(d => fmt(d.amount_ghs)), sum: fmt(total) }
+        : { lines: [fmt(total)], sum: null }
       banking.forEach((b, idx) => {
-        checkPage(7)
-        if (idx % 2 === 0) { doc.setFillColor(...LIGHT_ASH); doc.rect(ml, y - 4, cw, 7, 'F') }
+        const nibC = s3Cell(b.nib_deposits, b.nib_ghs)
+        const umbC = s3Cell(b.umb_deposits, b.umb_momo_ghs)
+        const rowLines = Math.max(nibC.lines.length + (nibC.sum ? 1 : 0), umbC.lines.length + (umbC.sum ? 1 : 0))
+        const rowH = rowLines === 1 ? 7 : rowLines * 4 + 3
+        checkPage(rowH)
+        if (idx % 2 === 0) { doc.setFillColor(...LIGHT_ASH); doc.rect(ml, y - 4, cw, rowH, 'F') }
         x = ml
-        const row = [b.entry_date, fmt(b.nib_ghs), fmt(b.umb_momo_ghs), fmt(b.gocard_ghs), fmt(b.coupons_50_ghs), fmt(b.coupons_100_ghs), `GHS ${fmt(b.total_banked_ghs)}`]
-        row.forEach((cell, i) => { doc.text(String(cell), x + 1, y); x += s3Widths[i] })
-        y += 7
+        const row = [b.entry_date, null, null, fmt(b.gocard_ghs), fmt(b.coupons_50_ghs), fmt(b.coupons_100_ghs), `GHS ${fmt(b.total_banked_ghs)}`]
+        row.forEach((cell, i) => {
+          if (i === 1 || i === 2) {
+            const c = i === 1 ? nibC : umbC
+            c.lines.forEach((ln, li) => doc.text(ln, x + 1, y + li * 4))
+            if (c.sum) {
+              doc.setFont('helvetica', 'bold')
+              doc.text(c.sum, x + 1, y + c.lines.length * 4)
+              doc.setFont('helvetica', 'normal')
+            }
+          } else {
+            doc.text(String(cell), x + 1, y)
+          }
+          x += s3Widths[i]
+        })
+        y += rowH
       })
 
       checkPage(8)
@@ -1458,8 +1495,8 @@ export default function Reports() {
                     {report.section3_banking.map(b => (
                       <tr key={b.id}>
                         <td>{b.entry_date}</td>
-                        <td className="td-calc">{parseFloat(b.nib_ghs).toFixed(2)}</td>
-                        <td className="td-calc">{parseFloat(b.umb_momo_ghs).toFixed(2)}</td>
+                        <td className="td-calc" style={{ verticalAlign: 'top' }}>{renderDepositCell(b.nib_deposits, b.nib_ghs)}</td>
+                        <td className="td-calc" style={{ verticalAlign: 'top' }}>{renderDepositCell(b.umb_deposits, b.umb_momo_ghs)}</td>
                         <td className="td-calc">{parseFloat(b.gocard_ghs).toFixed(2)}</td>
                         <td className="td-calc">{parseFloat(b.coupons_50_ghs).toFixed(2)}</td>
                         <td className="td-calc">{parseFloat(b.coupons_100_ghs).toFixed(2)}</td>

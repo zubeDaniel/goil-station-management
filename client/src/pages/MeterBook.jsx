@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useMemo, Fragment } from 'react'
 import api from '../lib/api'
+import { addDays } from '../lib/dates'
 import { useToast } from '../components/Toast'
 import { useRole } from '../hooks/useRole'
 
@@ -290,14 +291,18 @@ isAdminOrManager ? api.get('/prices/current') : Promise.resolve({ data: {} }),
 
     setDeliveryFetching(true)
     try {
-      const res = await api.get(`/deliveries?date=${form.reading_date}`)
+      // Readings are entered the morning after the day they record, so this
+      // entry's delivery is the one logged on the previous day (its real
+      // arrival date) — same rule Tank Stock uses.
+      const deliveryDate = addDays(form.reading_date, -1)
+      const res = await api.get(`/deliveries?date=${deliveryDate}`)
       const records = res.data
 
       if (!records || records.length === 0) {
         showToast(
           'warning',
           'No delivery record found',
-          `No tanker delivery logged for ${form.reading_date}. Log it in Deliveries first.`
+          `No tanker delivery logged for ${deliveryDate} (the day these readings cover). Log it in Deliveries first.`
         )
         setDeliveryChecked(false)
         return
@@ -685,7 +690,7 @@ isAdminOrManager ? api.get('/prices/current') : Promise.resolve({ data: {} }),
                 )}
               </div>
               <span style={{ fontSize:13, fontWeight:500, color: deliveryChecked ? 'var(--amber)' : 'var(--text-2)' }}>
-                {deliveryFetching ? 'Checking deliveries…' : 'Delivery received today'}
+                {deliveryFetching ? 'Checking deliveries…' : `Delivery received on ${addDays(form.reading_date, -1)}`}
               </span>
             </div>
 
@@ -736,7 +741,7 @@ isAdminOrManager ? api.get('/prices/current') : Promise.resolve({ data: {} }),
             }}>
               <span style={{ fontSize:12, fontWeight:600, color:'var(--amber)', marginRight:4 }}>
                 <i className="ph ph-truck" style={{ marginRight:4 }}></i>
-                Delivery logged for {form.reading_date}:
+                Delivery logged for {addDays(form.reading_date, -1)}:
               </span>
               {deliveryData.map(d => (
                 <span key={d.id} style={{ fontSize:12, color:'var(--text-2)' }}>

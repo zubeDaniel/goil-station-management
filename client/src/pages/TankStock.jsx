@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useRole } from '../hooks/useRole'
 import api from '../lib/api'
+import { addDays } from '../lib/dates'
 import { useToast } from '../components/Toast'
 
 const TANKS = [
@@ -75,7 +76,10 @@ export default function TankStock() {
       // free-typed. A manually-entered number here, disconnected from
       // what was actually logged in Deliveries, is exactly how a wrong
       // figure ends up saved with no real record of where it came from.
-      const res = await api.get(`/deliveries?date=${row.stock_date}&tank_id=${row.tank_id}`)
+      // A tank stock entry dated D closes physical day D-1, and deliveries are
+      // logged on the day the truck arrived — so this entry's delivery is the
+      // one dated the day BEFORE stock_date (same rule the server applies).
+      const res = await api.get(`/deliveries?date=${addDays(row.stock_date, -1)}&tank_id=${row.tank_id}`)
       const record = res.data?.[0] || null
       setEditDeliveryRecord(record)
       setEditForm(p => ({ ...p, delivery_litres: String(record ? record.actual_litres : 0) }))
@@ -251,14 +255,17 @@ export default function TankStock() {
     }
 
     try {
-      const res = await api.get(`/deliveries?date=${form.stock_date}&tank_id=${tankId}`)
+      // This closing is for the PREVIOUS day, so look for the delivery logged on
+      // that day (its real arrival date) — not on the date of this entry.
+      const deliveryDate = addDays(form.stock_date, -1)
+      const res = await api.get(`/deliveries?date=${deliveryDate}&tank_id=${tankId}`)
       const records = res.data
 
       if (!records || records.length === 0) {
         showToast(
           'warning',
           'No delivery record found',
-          `No tanker delivery logged for ${tankId} on ${form.stock_date}. Log it in Deliveries first.`
+          `No tanker delivery logged for ${tankId} on ${deliveryDate} (the day this entry closes). Log it in Deliveries first.`
         )
         setDelivery(prev => ({ ...prev, [tankId]: emptyDelivery() }))
         return
@@ -445,7 +452,7 @@ export default function TankStock() {
                   )}
                 </div>
                 <span style={{ fontSize:13, fontWeight:500, color: del.checked ? 'var(--amber)' : 'var(--text-2)' }}>
-                  {del.fetching ? 'Checking deliveries…' : 'Delivery received today'}
+                  {del.fetching ? 'Checking deliveries…' : `Delivery received on ${addDays(form.stock_date, -1)}`}
                 </span>
                 {del.checked && del.record && (
                   <span style={{ marginLeft:'auto', fontSize:11, color:'var(--amber)', fontFamily:'var(--font-mono)' }}>
@@ -564,7 +571,7 @@ export default function TankStock() {
               )}
               {!del.checked && (
                 <div style={{ marginTop:8, fontSize:11, color:'var(--text-3)' }}>
-                  No delivery today — both variances are identical
+                  No delivery on {addDays(form.stock_date, -1)} — both variances are identical
                 </div>
               )}
             </div>

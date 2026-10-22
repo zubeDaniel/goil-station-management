@@ -39,12 +39,27 @@ async function getLitresSoldForDate(supabaseAdmin, fuelType, stockDate) {
   return (data || []).reduce((sum, r) => sum + (parseFloat(r.litres_sold) || 0), 0);
 }
 
+// Dip readings are entered the morning AFTER the day they close, so a tank stock
+// entry dated D+1 closes physical day D. Deliveries are logged on the day the
+// truck actually arrived (matching the station's paper records), so the delivery
+// that belongs to the entry dated D+1 is the one dated D — the day before.
+// (Same one-day entry lag the reports already correct for meter readings.)
+function previousDate(dateStr) {
+  // Malformed input is passed through untouched so the database rejects it
+  // exactly as it did before this change (rather than a RangeError from here).
+  if (typeof dateStr !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return dateStr;
+  const [y, m, d] = dateStr.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() - 1);
+  return dt.toISOString().slice(0, 10);
+}
+
 async function getWaybillExpectedLitres(supabaseAdmin, tankId, stockDate) {
   const { data, error } = await supabaseAdmin
     .from('tanker_deliveries')
     .select('expected_litres')
     .eq('tank_id', tankId)
-    .eq('delivery_date', stockDate);
+    .eq('delivery_date', previousDate(stockDate));
   if (error) throw new Error(`Failed to look up waybill expected litres: ${error.message}`);
   return (data || []).reduce((sum, r) => sum + (parseFloat(r.expected_litres) || 0), 0);
 }

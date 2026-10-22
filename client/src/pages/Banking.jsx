@@ -2,6 +2,63 @@ import { useState, useEffect } from 'react'
 import api from '../lib/api'
 import { useToast } from '../components/Toast'
 
+// NIB and UMB can be banked in several separate deposits on the same day (one
+// per slip). Each is entered as its own row; the day's NIB / UMB figure is their
+// sum. GoCard and the coupon fields stay single-value.
+const BANKS = [
+  { listKey: 'nib_deposits', label: 'NIB' },
+  { listKey: 'umb_deposits', label: 'UMB / MoMo' },
+]
+const SINGLE_CHANNELS = [
+  { key: 'gocard_ghs', label: 'GoCard' },
+  { key: 'coupons_50_ghs', label: 'Coupons @50', hint: 'Physical coupon deposit by denomination — separate from Sales Book\'s coupon revenue, which this reconciles against' },
+  { key: 'coupons_100_ghs', label: 'Coupons @100' },
+]
+// Used by the month totals table (stored daily totals, unchanged)
+const CHANNELS = [
+  { key: 'nib_ghs', label: 'NIB' },
+  { key: 'umb_momo_ghs', label: 'UMB / MoMo' },
+  ...SINGLE_CHANNELS,
+]
+
+const MAX_DEPOSITS = 20
+const blankDeposit = () => ({ amount: '', slip_ref: '' })
+const todayStr = () => new Date().toISOString().split('T')[0]
+const emptyForm = () => ({
+  entry_date: todayStr(),
+  nib_deposits: [blankDeposit()],
+  umb_deposits: [blankDeposit()],
+  gocard_ghs: '0', coupons_50_ghs: '0', coupons_100_ghs: '0',
+})
+
+const money = (n) => (parseFloat(n) || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+// Same plain 2-decimal style the rest of the history table uses (no thousands separators).
+const fx = (n) => (parseFloat(n) || 0).toFixed(2)
+// Each deposit is rounded to 2dp BEFORE summing — exactly what the server does —
+// so the total shown while typing can never differ from the one that gets saved.
+const r2 = (n) => Math.round((parseFloat(n) || 0) * 100) / 100
+const sumDeposits = (list) => (list || []).reduce((s, d) => s + r2(d.amount), 0)
+const toRows = (list) => (list && list.length > 0
+  ? list.map(d => ({ amount: String(d.amount_ghs), slip_ref: d.slip_ref || '' }))
+  : [blankDeposit()])
+const toPayload = (list) => list
+  .filter(d => r2(d.amount) > 0)
+  .map(d => ({ amount_ghs: r2(d.amount), slip_ref: d.slip_ref.trim() }))
+
+// History-table cell: one amount normally; with several deposits, each on its
+// own line (slip ref beside it) and the day's sum underneath.
+function DepositCell({ deposits, total }) {
+  const slip = (d) => d.slip_ref && <span style={{ fontSize: 10, color: 'var(--text-3)', marginLeft: 6 }}>#{d.slip_ref}</span>
+  if (!deposits || deposits.length === 0) return <>{fx(total)}</>
+  if (deposits.length === 1) return <>{fx(total)}{slip(deposits[0])}</>
+  return (
+    <div>
+      {deposits.map((d, i) => <div key={i}>{fx(d.amount_ghs)}{slip(d)}</div>)}
+      <div style={{ borderTop: '1px solid var(--border)', marginTop: 3, paddingTop: 3, fontWeight: 700 }}>{fx(total)}</div>
+    </div>
+  )
+}
+
 export default function Banking() {
   const { showToast } = useToast()
   const [entries, setEntries] = useState([])
@@ -9,14 +66,7 @@ export default function Banking() {
   const [saving, setSaving] = useState(false)
   const [editingId, setEditingId] = useState(null)
   const [selectedMonth, setSelectedMonth] = useState(new Date().toISOString().slice(0, 7))
-  const [form, setForm] = useState({
-    entry_date: new Date().toISOString().split('T')[0],
-    nib_ghs: '0',
-    umb_momo_ghs: '0',
-    gocard_ghs: '0',
-    coupons_50_ghs: '0',
-    coupons_100_ghs: '0'
-  })
+  const [form, setForm] = useState(emptyForm())
 
   const startDate = `${selectedMonth}-01`
   const endDate = new Date(new Date(startDate).getFullYear(), new Date(startDate).getMonth() + 1, 0)
@@ -38,32 +88,39 @@ export default function Banking() {
     }
   }
 
-  const channels = [
-    { key: 'nib_ghs', label: 'NIB' },
-    { key: 'umb_momo_ghs', label: 'UMB / MoMo' },
-    { key: 'gocard_ghs', label: 'GoCard' },
-    { key: 'coupons_50_ghs', label: 'Coupons @50', hint: 'Physical coupon deposit by denomination — separate from Sales Book\'s coupon revenue, which this reconciles against' },
-    { key: 'coupons_100_ghs', label: 'Coupons @100' },
-  ]
+  const nibTotal = sumDeposits(form.nib_deposits)
+  const umbTotal = sumDeposits(form.umb_deposits)
+  const total = nibTotal + umbTotal
+    + SINGLE_CHANNELS.reduce((s, ch) => s + (parseFloat(form[ch.key]) || 0), 0)
 
-  const total = channels.reduce((s, ch) => s + (parseFloat(form[ch.key]) || 0), 0)
+  // ── Deposit-row editing ──────────────────────────────────
+  const setDeposit = (listKey, i, field, value) =>
+    setForm(p => ({ ...p, [listKey]: p[listKey].map((d, idx) => idx === i ? { ...d, [field]: value } : d) }))
+  const addDeposit = (listKey) =>
+    setForm(p => p[listKey].length >= MAX_DEPOSITS ? p : ({ ...p, [listKey]: [...p[listKey], blankDeposit()] }))
+  const removeDeposit = (listKey, i) =>
+    setForm(p => p[listKey].length <= 1 ? p : ({ ...p, [listKey]: p[listKey].filter((_, idx) => idx !== i) }))
 
   const handleSave = async () => {
     setSaving(true)
     try {
+      const payload = {
+        entry_date: form.entry_date,
+        nib_deposits: toPayload(form.nib_deposits),
+        umb_deposits: toPayload(form.umb_deposits),
+        gocard_ghs: form.gocard_ghs,
+        coupons_50_ghs: form.coupons_50_ghs,
+        coupons_100_ghs: form.coupons_100_ghs,
+      }
       if (editingId) {
-        await api.put(`/banking/${editingId}`, form)
+        await api.put(`/banking/${editingId}`, payload)
         showToast('success', 'Banking entry updated', form.entry_date)
         setEditingId(null)
       } else {
-        await api.post('/banking', form)
+        await api.post('/banking', payload)
         showToast('success', 'Banking entry saved', form.entry_date)
       }
-      setForm({
-        entry_date: new Date().toISOString().split('T')[0],
-        nib_ghs: '0', umb_momo_ghs: '0', gocard_ghs: '0',
-        coupons_50_ghs: '0', coupons_100_ghs: '0'
-      })
+      setForm(emptyForm())
       await loadData()
     } catch (err) {
       showToast('error', 'Save failed', err.response?.data?.error)
@@ -76,8 +133,8 @@ export default function Banking() {
     setEditingId(entry.id)
     setForm({
       entry_date: entry.entry_date,
-      nib_ghs: String(entry.nib_ghs || 0),
-      umb_momo_ghs: String(entry.umb_momo_ghs || 0),
+      nib_deposits: toRows(entry.nib_deposits),
+      umb_deposits: toRows(entry.umb_deposits),
       gocard_ghs: String(entry.gocard_ghs || 0),
       coupons_50_ghs: String(entry.coupons_50_ghs || 0),
       coupons_100_ghs: String(entry.coupons_100_ghs || 0),
@@ -87,11 +144,7 @@ export default function Banking() {
 
   const handleCancelEdit = () => {
     setEditingId(null)
-    setForm({
-      entry_date: new Date().toISOString().split('T')[0],
-      nib_ghs: '0', umb_momo_ghs: '0', gocard_ghs: '0',
-      coupons_50_ghs: '0', coupons_100_ghs: '0'
-    })
+    setForm(emptyForm())
   }
 
   const handleDelete = async (id, date) => {
@@ -106,8 +159,8 @@ export default function Banking() {
     }
   }
 
-  // Monthly totals
-  const monthlyTotals = channels.reduce((acc, ch) => {
+  // Monthly totals (stored daily totals — the sum of each day's deposits)
+  const monthlyTotals = CHANNELS.reduce((acc, ch) => {
     acc[ch.key] = entries.reduce((s, e) => s + parseFloat(e[ch.key] || 0), 0)
     return acc
   }, {})
@@ -152,8 +205,54 @@ export default function Banking() {
               onChange={e => setForm(p => ({ ...p, entry_date: e.target.value }))} />
             {editingId && <span className="form-hint">Date can't be changed while editing — delete and re-create instead</span>}
           </div>
+
+          {/* NIB and UMB — one row per deposit slip */}
+          {BANKS.map(bank => {
+            const list = form[bank.listKey]
+            const subtotal = sumDeposits(list)
+            const filled = list.filter(d => r2(d.amount) > 0).length
+            return (
+              <div key={bank.listKey} style={{ border: '1px solid var(--border)', borderRadius: 'var(--r-md)', marginBottom: 12, overflow: 'hidden' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: 'var(--surface-2)', padding: '9px 12px', borderBottom: '1px solid var(--border)' }}>
+                  <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--navy)' }}>
+                    {bank.label}
+                    {filled > 1 && <span className="badge badge-amber" style={{ marginLeft: 8 }}>{filled} deposits</span>}
+                  </span>
+                  <span style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--calc-text)' }}>GHS {money(subtotal)}</span>
+                </div>
+                <div style={{ padding: 12 }}>
+                  {list.map((d, i) => (
+                    <div key={i} style={{ display: 'grid', gridTemplateColumns: '22px 1.2fr 1fr 34px', gap: 8, alignItems: 'end', marginBottom: 8 }}>
+                      <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-3)', paddingBottom: 10 }}>{i + 1}</div>
+                      <div className="form-group">
+                        <label className="form-label">Amount (GHS)</label>
+                        <input className="form-input" type="number" min="0" step="0.01" placeholder="0.00" value={d.amount}
+                          onChange={e => setDeposit(bank.listKey, i, 'amount', e.target.value)} />
+                      </div>
+                      <div className="form-group">
+                        <label className="form-label">Slip ref (optional)</label>
+                        <input className="form-input" maxLength={60} placeholder="e.g. slip no." value={d.slip_ref}
+                          onChange={e => setDeposit(bank.listKey, i, 'slip_ref', e.target.value)} />
+                      </div>
+                      <button className="btn btn-ghost btn-sm" style={{ height: 34, justifyContent: 'center', color: 'var(--red)' }}
+                        title="Remove this deposit" aria-label={`Remove ${bank.label} deposit ${i + 1}`}
+                        disabled={list.length <= 1} onClick={() => removeDeposit(bank.listKey, i)}>
+                        <i className="ph ph-x"></i>
+                      </button>
+                    </div>
+                  ))}
+                  <button className="btn btn-ghost btn-sm" style={{ width: '100%', justifyContent: 'center', borderStyle: 'dashed' }}
+                    disabled={list.length >= MAX_DEPOSITS} onClick={() => addDeposit(bank.listKey)}>
+                    <i className="ph ph-plus"></i> Add another {bank.label} deposit
+                  </button>
+                </div>
+              </div>
+            )
+          })}
+
+          {/* Single-value channels */}
           <div className="form-row">
-            {channels.map(ch => (
+            {SINGLE_CHANNELS.map(ch => (
               <div key={ch.key} className="form-group">
                 <label className="form-label">{ch.label} (GHS)</label>
                 <input className="form-input" type="number" value={form[ch.key]}
@@ -194,7 +293,7 @@ export default function Banking() {
           <table>
             <thead><tr><th>Channel</th><th>Month total (GHS)</th><th>%</th></tr></thead>
             <tbody>
-              {channels.map(ch => (
+              {CHANNELS.map(ch => (
                 <tr key={ch.key}>
                   <td>{ch.label}</td>
                   <td className="td-calc">{monthlyTotals[ch.key].toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
@@ -227,8 +326,8 @@ export default function Banking() {
               {entries.map(e => (
                 <tr key={e.id}>
                   <td>{e.entry_date}</td>
-                  <td className="td-calc">{parseFloat(e.nib_ghs).toFixed(2)}</td>
-                  <td className="td-calc">{parseFloat(e.umb_momo_ghs).toFixed(2)}</td>
+                  <td className="td-calc" style={{ verticalAlign: 'top' }}><DepositCell deposits={e.nib_deposits} total={e.nib_ghs} /></td>
+                  <td className="td-calc" style={{ verticalAlign: 'top' }}><DepositCell deposits={e.umb_deposits} total={e.umb_momo_ghs} /></td>
                   <td className="td-calc">{parseFloat(e.gocard_ghs).toFixed(2)}</td>
                   <td className="td-calc">{parseFloat(e.coupons_50_ghs).toFixed(2)}</td>
                   <td className="td-calc">{parseFloat(e.coupons_100_ghs).toFixed(2)}</td>

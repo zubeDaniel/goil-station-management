@@ -48,7 +48,7 @@ export default function Dashboard() {
       api.get(`/tank-stock?start_date=${today}&end_date=${today}`),
       api.get('/creditors'),
       api.get(`/banking?start_date=${monthStart}&end_date=${today}`),
-      user?.role === 'admin' ? api.get('/audit?limit=5') : Promise.resolve({ data: [] }),
+      user?.role === 'admin' ? api.get('/audit?limit=5&exclude_tables=bank_deposits') : Promise.resolve({ data: [] }),
     ]).then(([setupRes, compRes, meterRes, tankRes, credRes, bankRes, auditRes]) => {
       setSetup(setupRes.data)
       setCompliance(compRes.data)

@@ -1,4 +1,5 @@
 const express = require('express');
+const { fetchBanking } = require('../lib/bankDeposits');
 const router = express.Router();
 // Uses req.supabaseAdmin (per-request, actor-attributed) attached by the auth middleware — see middleware/auth.js
 const { authenticate, adminOrManager } = require('../middleware/auth');
@@ -333,7 +334,10 @@ async function assembleReport(supabaseAdmin, month) {
   ] = await Promise.all([
     supabaseAdmin.from('pump_meter_readings').select('*').gte('reading_date', laggedStart).lte('reading_date', laggedEnd).order('reading_date', { ascending: true }).order('pump_id', { ascending: true }).order('fuel_type', { ascending: true }),
     supabaseAdmin.from('sales_book').select('*').gte('entry_date', laggedStart).lte('entry_date', laggedEnd).order('entry_date', { ascending: true }),
-    supabaseAdmin.from('banking').select('*').gte('entry_date', startDate).lte('entry_date', endDate).order('entry_date', { ascending: true }),
+    // fetchBanking returns each day's row plus nib_deposits / umb_deposits arrays
+    // (one entry per physical deposit slip) for Section 3. nib_ghs / umb_momo_ghs /
+    // total_banked_ghs are unchanged, so Sections 5 and 12 read exactly as before.
+    fetchBanking(supabaseAdmin, { start_date: startDate, end_date: endDate, ascending: true }),
     // .is('deleted_at', null) was missing here — the only one of these six
     // queries without it (compare expenses, one line below). credit_sales
     // is the one table among these with routine soft-delete traffic (see
@@ -1000,7 +1004,13 @@ router.get('/:month', authenticate, adminOrManager, async (req, res) => {
       req.supabaseAdmin.from('creditors').select('id, name, current_balance_ghs, credit_limit_ghs, is_active').is('deleted_at', null),
       req.supabaseAdmin.from('compliance_certificates').select('certificate_name, issuing_authority, expiry_date, alert_days_before, status').is('deleted_at', null),
       // tanker_deliveries has NO deleted_at column — do not add that filter.
-      req.supabaseAdmin.from('tanker_deliveries').select('delivery_date, fuel_type, tank_id, expected_litres, actual_litres, shortage_litres').gte('delivery_date', startDate).lte('delivery_date', endDate),
+      // A delivery is logged on its real arrival date D and counted by the tank stock
+      // entry dated D+1 (see tankstock.js). This month's tank rows are stock_date in
+      // [startDate, endDate], so the deliveries that feed them are delivery_date in
+      // [startDate-1, endDate-1]. Using the plain month window would put the shortage of
+      // a truck that arrives on the last day of a month in a different month from the
+      // tank row it explains.
+      req.supabaseAdmin.from('tanker_deliveries').select('delivery_date, fuel_type, tank_id, expected_litres, actual_litres, shortage_litres').gte('delivery_date', shiftDateBack(startDate)).lte('delivery_date', shiftDateBack(endDate)),
       // Payments are not part of the one-day entry lag (only meter / sales / credit_sales are).
       req.supabaseAdmin.from('creditor_payments').select('creditor_id, payment_date, amount_ghs').gte('payment_date', startDate).lte('payment_date', endDate).is('deleted_at', null),
       // Everything recorded AFTER the month, to rebuild the month-end creditor balance
