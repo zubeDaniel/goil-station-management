@@ -1,6 +1,7 @@
 import { useState, Fragment } from 'react'
 import api from '../lib/api'
 import { useToast } from '../components/Toast'
+import { drawDailyLitresChart } from '../lib/pdfCharts'
 
 // Section 3 NIB / UMB cell: a normal day shows one amount; a day banked in
 // several deposits lists each amount on its own line with the day's sum below.
@@ -120,7 +121,16 @@ export default function Reports() {
       const sales = data.section2_sales_book || []
       const banking = data.section3_banking || []
       const credits = data.section4_credit_sales || []
-      const tanks = data.section6_stock_movement || []
+
+      // Same formula as netOfRtt() in server/routes/reports.js: litres returned to the tank (RTT) are a stock
+      // event, never revenue, so every revenue figure in the report is net of them.
+      const netOfRtt = (r) => {
+        const l = parseFloat(r.litres_sold || 0)
+        const a = parseFloat(r.amount_ghs || 0)
+        const rt = Math.min(Math.max(parseFloat(r.rtt_litres || 0), 0), Math.max(l, 0))
+        return l > 0 ? a - rt * (a / l) : a
+      }
+      const noExpenses = !data.section5_consolidated || data.section5_consolidated.total_expenses === 0
 
       const totalSXP = meter.filter(r => r.fuel_type === 'SXP').reduce((s, r) => s + parseFloat(r.litres_sold || 0), 0)
       const totalDXP = meter.filter(r => r.fuel_type === 'DXP').reduce((s, r) => s + parseFloat(r.litres_sold || 0), 0)
@@ -168,6 +178,9 @@ export default function Reports() {
       const mr = 15
       const cw = pw - ml - mr
       let y = 0
+      // Shared running x-position for the inline table drawing (declared here because sections are
+      // now drawn in insight-first order, not the order the variable used to be introduced in).
+      let x = ml
 
       const newPage = () => { doc.addPage(); y = 20 }
       const checkPage = (needed = 20) => { if (y + needed > ph - 20) newPage() }
@@ -319,7 +332,8 @@ export default function Reports() {
         ['Credit Sales (all creditors)', `GHS ${fmt(totalCredit)}`, totalCredit, 'total_credit'],
         ['Dealer Earnings', `GHS ${fmt(dealerEarnings)}`, dealerEarnings, 'dealer_earnings'],
         ['Total Expenses', `GHS ${fmt(totalExpenses)}`, totalExpenses, 'total_expenses'],
-        ['Net Dealer Profit', `GHS ${fmt(netDealerProfit)}`, netDealerProfit, 'net_dealer_profit'],
+        // With no expenses logged this is dealer margin BEFORE expenses, not profit — say so on the page.
+        [noExpenses ? 'Dealer margin (no expenses logged)' : 'Net Dealer Profit', `GHS ${fmt(netDealerProfit)}`, netDealerProfit, 'net_dealer_profit'],
       ]
 
       // Month-over-month deltas — null when there's no prior-month data to
@@ -331,7 +345,7 @@ export default function Reports() {
 
       doc.setFontSize(9)
       kpis.forEach(([label, value, rawValue, key], i) => {
-        const isProfit = label === 'Net Dealer Profit'
+        const isProfit = key === 'net_dealer_profit'
         if (i % 2 === 0) {
           doc.setFillColor(...LIGHT_ASH)
           doc.rect(ml, y - 4, cw, 8, 'F')
@@ -340,7 +354,9 @@ export default function Reports() {
         doc.setTextColor(...LABEL_GREY)
         doc.text(label, ml + 2, y)
 
-        if (prevS5 && parseFloat(prevS5[key] || 0) !== 0) {
+        // Sales Book revenue is only compared when both months recorded the same channels (see reports.js).
+        const comparable = !(key === 'total_revenue' && data.previous_month?.sales_book_comparable === false)
+        if (comparable && prevS5 && parseFloat(prevS5[key] || 0) !== 0) {
           const prevVal = parseFloat(prevS5[key])
           const delta = (rawValue - prevVal) / Math.abs(prevVal)
           // jsPDF's built-in fonts don't include ▲/▼ (U+25B2/U+25BC) — they
@@ -385,21 +401,24 @@ export default function Reports() {
         y += 2
       }
 
-      // ── EXECUTIVE SUMMARY: 6-month revenue trend ────────
+      // ── EXECUTIVE SUMMARY: 6-month volume trend ─────────
+      // Litres per reported day, not revenue: a dealer earns per litre, and revenue moves with NPA prices
+      // and with which Sales Book channels were being recorded.
       const trend = data.revenue_trend || []
       if (trend.length > 0) {
         y += 4
-        checkPage(60)
+        checkPage(66)
         doc.setFont('helvetica', 'bold')
         doc.setFontSize(9)
         doc.setTextColor(...ORANGE)
-        doc.text('REVENUE TREND — LAST 6 MONTHS (SXP vs DXP)', ml, y)
+        doc.text('VOLUME TREND — LITRES PER REPORTED DAY, LAST 6 MONTHS (SXP vs DXP)', ml, y)
         y += 4
 
+        const perDay = (t) => (t.days > 0 ? { s: t.sxp_litres / t.days, d: t.dxp_litres / t.days } : { s: 0, d: 0 })
         const chartX = ml + 4
         const chartW = cw - 8
-        const chartH = 42
-        const chartMax = Math.max(1, ...trend.flatMap(t => [t.sxp, t.dxp])) * 1.15
+        const chartH = 38
+        const chartMax = Math.max(1, ...trend.flatMap(t => { const v = perDay(t); return [v.s, v.d] })) * 1.25
         const groupW = chartW / trend.length
         const barW = groupW * 0.30
         const barGap = groupW * 0.06
@@ -409,32 +428,42 @@ export default function Reports() {
         doc.line(chartX, y + chartH, chartX + chartW, y + chartH)
 
         trend.forEach((t, i) => {
+          const v = perDay(t)
           const groupX = chartX + i * groupW + groupW * 0.17
-          const hSxp = (t.sxp / chartMax) * chartH
-          const hDxp = (t.dxp / chartMax) * chartH
+          const hS = (v.s / chartMax) * chartH
+          const hD = (v.d / chartMax) * chartH
           doc.setFillColor(...ORANGE)
-          doc.rect(groupX, y + chartH - hSxp, barW, hSxp, 'F')
+          doc.rect(groupX, y + chartH - hS, barW, hS, 'F')
           doc.setFillColor(...DARK_GREY)
-          doc.rect(groupX + barW + barGap, y + chartH - hDxp, barW, hDxp, 'F')
-          doc.setFontSize(6.5)
+          doc.rect(groupX + barW + barGap, y + chartH - hD, barW, hD, 'F')
+          doc.setFontSize(6)
           doc.setFont('helvetica', 'normal')
           doc.setTextColor(...MID_GREY)
-          const [ty, tm] = t.month.split('-')
+          if (v.s > 0) doc.text(Math.round(v.s).toLocaleString('en-US'), groupX + barW / 2, y + chartH - hS - 1, { align: 'center' })
+          if (v.d > 0) doc.text(Math.round(v.d).toLocaleString('en-US'), groupX + barW + barGap + barW / 2, y + chartH - hD - 1, { align: 'center' })
           const monthShort = new Date(`${t.month}-01T00:00:00Z`).toLocaleString('default', { month: 'short', timeZone: 'UTC' })
-          doc.text(monthShort, groupX + barW + barGap / 2, y + chartH + 5, { align: 'center' })
+          const cx = groupX + barW + barGap / 2
+          doc.setFontSize(6.5)
+          doc.text(monthShort, cx, y + chartH + 5, { align: 'center' })
+          doc.setFontSize(5.5)
+          doc.text(t.days > 0 ? `margin GHS ${Math.round((t.sxp_litres + t.dxp_litres) * margin).toLocaleString('en-US')}` : 'no data', cx, y + chartH + 9, { align: 'center' })
         })
 
-        y += chartH + 10
+        y += chartH + 15
         doc.setFillColor(...ORANGE)
         doc.rect(chartX, y - 3, 3, 3, 'F')
         doc.setFontSize(7.5)
         doc.setTextColor(...MID_GREY)
-        doc.text('SXP revenue', chartX + 5, y)
+        doc.text('SXP litres / day', chartX + 5, y)
         doc.setFillColor(...DARK_GREY)
-        doc.rect(chartX + 35, y - 3, 3, 3, 'F')
-        doc.text('DXP revenue', chartX + 40, y)
-        y += 6
+        doc.rect(chartX + 38, y - 3, 3, 3, 'F')
+        doc.text('DXP litres / day', chartX + 43, y)
+        y += 5
+        footnote(`Litres per day with a meter entry. Dealer margin = litres x GHS ${margin}/L (this report's rate applied to every month shown).`)
       }
+
+      // ── How the report is laid out ──────────────────────
+      paragraph('Layout: the pages that follow (Part A) are summaries, checks and anything needing attention - Sections 1 (totals and charts), 9, 8, 5, 6, 10, 11, 12, 13 and 14. The day-by-day records they are built from are at the end (Part B): Sections 1 (daily), 2, 3, 4 and 7.', { size: 7.5, color: MID_GREY, style: 'italic', gap: 4 })
 
       // ── SECTION 1: FUEL SALES ──────────────────────────
       // Normally the cover fills page 1 and Section 1 opens page 2. With
@@ -486,61 +515,428 @@ export default function Reports() {
         y += 1
         footnote(`Per day = total / days with a meter entry (${split.days_reported} of ${split.days_in_month} days). Per week = total / ${pw7.number_of_weeks} week-of-month buckets, the short trailing bucket included as-is - the same convention as Section 8.`)
 
-        // The ONE new chart: weekly trajectory, daily-average litres per
-        // reported day (not bucket totals — the short trailing bucket would
-        // read as a false slowdown). Drawn the same way as the trend chart.
-        const wk = (data.weekly_chart?.weeks || []).filter(w => w.days_with_data > 0)
-        if (wk.length > 0) {
-          checkPage(74)
-          subHead('WEEKLY TREND - DAILY AVERAGE LITRES PER WEEK (SXP vs DXP)')
-          const cX = ml + 4, cW = cw - 8, cH = 38
-          const cMax = Math.max(1, ...wk.flatMap(w => [w.sxp_litres_per_reported_day, w.dxp_litres_per_reported_day])) * 1.22
-          const gW = cW / wk.length
-          const bW = Math.min(gW * 0.30, 16)
-          const bGap = gW * 0.05
-          doc.setDrawColor(...ASH)
-          doc.setLineWidth(0.2)
-          doc.line(cX, y + cH, cX + cW, y + cH)
-          wk.forEach((w, i) => {
-            const gx = cX + i * gW + (gW - (2 * bW + bGap)) / 2
-            const hS = (w.sxp_litres_per_reported_day / cMax) * cH
-            const hD = (w.dxp_litres_per_reported_day / cMax) * cH
-            doc.setFillColor(...ORANGE)
-            doc.rect(gx, y + cH - hS, bW, hS, 'F')
-            doc.setFillColor(...DARK_GREY)
-            doc.rect(gx + bW + bGap, y + cH - hD, bW, hD, 'F')
-            doc.setFont('helvetica', 'normal')
-            doc.setFontSize(6)
-            doc.setTextColor(...LABEL_GREY)
-            doc.text(String(Math.round(w.sxp_litres_per_reported_day)), gx + bW / 2, y + cH - hS - 1.2, { align: 'center' })
-            doc.text(String(Math.round(w.dxp_litres_per_reported_day)), gx + bW + bGap + bW / 2, y + cH - hD - 1.2, { align: 'center' })
-            doc.setFontSize(6.5)
-            doc.setTextColor(...MID_GREY)
-            doc.text(`W${w.week}${w.days_with_data < 3 ? '*' : ''}`, gx + bW + bGap / 2, y + cH + 4.5, { align: 'center' })
-            doc.setFontSize(5.5)
-            doc.text(`${w.days_with_data}d`, gx + bW + bGap / 2, y + cH + 8, { align: 'center' })
+        // Daily litres, one bar per day: a quiet day, a missing day or a price change is visible at a glance.
+        // (This replaces the weekly-average bars; the week-by-week figures are still in Section 8.)
+        const dayMap = {}
+        meter.forEach(r => {
+          const d = (dayMap[r.reading_date] = dayMap[r.reading_date] || { date: r.reading_date, sxp: 0, dxp: 0 })
+          d[r.fuel_type === 'SXP' ? 'sxp' : 'dxp'] += parseFloat(r.litres_sold || 0)
+        })
+        const dailySeries = Object.values(dayMap).sort((a, b) => a.date.localeCompare(b.date))
+        if (dailySeries.length > 0) {
+          checkPage(80)
+          subHead('LITRES PER DAY (SXP + DXP)')
+          const isThisMonth = month === new Date().toISOString().slice(0, 7)
+          const used = drawDailyLitresChart(doc, {
+            x: ml, y: y + 6, w: cw, h: 48,
+            days: dailySeries,
+            daysInSlots: isThisMonth ? 0 : split.days_in_month,
+            priceChanges: data.price_changes || [],
+            colors: { ORANGE, DARK_GREY, MID_GREY, ASH, LIGHT_ASH, RED },
           })
-          y += cH + 14
-          doc.setFillColor(...ORANGE)
-          doc.rect(cX, y - 3, 3, 3, 'F')
-          doc.setFontSize(7.5)
-          doc.setTextColor(...MID_GREY)
-          doc.text('SXP litres / day', cX + 5, y)
-          doc.setFillColor(...DARK_GREY)
-          doc.rect(cX + 38, y - 3, 3, 3, 'F')
-          doc.text('DXP litres / day', cX + 43, y)
-          y += 5
-          footnote('Daily average per day with a meter entry, by week-of-month bucket (Nd = days of data). * = fewer than 3 days of data, excluded from the weekly-pace callout in Section 9.' +
-            (data.weekly_chart.excluded_rows > 0 ? ` ${data.weekly_chart.excluded_rows} implausible reading(s) left out of this chart.` : ''))
+          y += used + 6
+          footnote('One bar per business day (dates as shown in this report). Shaded columns are weekends. The grey dashed line is the daily average; a dashed orange line marks a price change from the price history; a red triangle marks a day the station traded but sold no SXP.')
         }
 
-        subHead('DAY-BY-DAY DETAIL')
       }
+
+      // ── SECTION 9: HEADLINE CALLOUTS ───────────────────
+      const headlines = data.section9_headlines || []
+      sectionBar('SECTION 9 — HEADLINE CALLOUTS')
+      if (headlines.length === 0) paragraph('No meter readings for this period.', { color: MID_GREY, style: 'italic' })
+      headlines.forEach(h => callout(h.text, h.tone))
+      footnote('Volume and pace callouts use litres, not revenue, because NPA price changes distort revenue comparisons between months. Pace is measured per day with a meter entry, so a short trailing week cannot fake a slowdown.')
+
+      // ── SECTION 8: SALES VOLUME AVERAGES ───────────────
+      const s8 = data.section8_volume_averages || { weeks: [], monthly: { sxp_weekly_avg: 0, dxp_weekly_avg: 0, combined_weekly_avg: 0 } }
+      checkPage(50)
+      doc.setFillColor(...DARK_GREY)
+      doc.rect(ml, y - 5, cw, 10, 'F')
+      doc.setFillColor(...ORANGE)
+      doc.rect(ml, y - 5, 3, 10, 'F')
+      doc.setTextColor(...WHITE)
+      doc.setFontSize(10)
+      doc.setFont('helvetica', 'bold')
+      doc.text('SECTION 8 — SALES VOLUME AVERAGES', ml + 6, y + 2)
+      y += 15
+
+      const s8Headers = ['Week', 'Days', 'SXP total (avg/day)', 'DXP total (avg/day)', 'Combined total (avg/day)']
+      const s8Widths = [36, 12, 42, 42, 48]
+      doc.setFillColor(...ASH)
+      doc.rect(ml, y - 4, cw, 7, 'F')
+      doc.setTextColor(...ORANGE)
+      doc.setFontSize(7.5)
+      doc.setFont('helvetica', 'bold')
+      x = ml
+      s8Headers.forEach((h, i) => { doc.text(h, x + 1, y); x += s8Widths[i] })
+      y += 5
+
+      s8.weeks.forEach((w, idx) => {
+        checkPage(7)
+        if (idx % 2 === 0) { doc.setFillColor(...LIGHT_ASH); doc.rect(ml, y - 4, cw, 7, 'F') }
+        doc.setFont('helvetica', 'normal')
+        doc.setTextColor(...DARK_GREY)
+        doc.setFontSize(7.5)
+        x = ml
+        const row = [
+          `W${w.week} (${w.label})`,
+          String(w.days_in_bucket),
+          `${fmtL(w.sxp_total)} (${fmtL(w.sxp_daily_avg)})`,
+          `${fmtL(w.dxp_total)} (${fmtL(w.dxp_daily_avg)})`,
+          `${fmtL(w.combined_total)} (${fmtL(w.combined_daily_avg)})`,
+        ]
+        row.forEach((cell, i) => { doc.text(String(cell), x + 1, y); x += s8Widths[i] })
+        y += 7
+      })
+
+      if (s8.weeks.length === 0) {
+        doc.setFont('helvetica', 'italic')
+        doc.setFontSize(8)
+        doc.setTextColor(...MID_GREY)
+        doc.text('No meter readings for this period.', ml + 1, y)
+        y += 7
+      }
+
+      checkPage(12)
+      doc.setFillColor(...ASH)
+      doc.rect(ml, y - 4, cw, 10, 'F')
+      doc.setFont('helvetica', 'bold')
+      doc.setFontSize(8)
+      doc.setTextColor(...DARK_GREY)
+      doc.text('MONTHLY WEEKLY AVERAGE', ml + 1, y)
+      doc.text(`SXP ${fmtL(s8.monthly.sxp_weekly_avg)}`, ml + s8Widths[0] + s8Widths[1] + 1, y)
+      doc.text(`DXP ${fmtL(s8.monthly.dxp_weekly_avg)}`, ml + s8Widths[0] + s8Widths[1] + s8Widths[2] + 1, y)
+      doc.text(`Combined ${fmtL(s8.monthly.combined_weekly_avg)}`, pw - mr, y, { align: 'right' })
+      y += 12
+
+      doc.setFont('helvetica', 'italic')
+      doc.setFontSize(7)
+      doc.setTextColor(...MID_GREY)
+      doc.text('Week-of-month buckets (not calendar weeks); the trailing bucket is short and included as-is in the monthly average.', ml, y)
+      y += 8
+
+      // ── SECTION 5: CONSOLIDATED ────────────────────────
+      checkPage(80)
+      doc.setFillColor(...DARK_GREY)
+      doc.rect(ml, y - 5, cw, 10, 'F')
+      doc.setFillColor(...ORANGE)
+      doc.rect(ml, y - 5, 3, 10, 'F')
+      doc.setTextColor(...WHITE)
+      doc.setFontSize(10)
+      doc.setFont('helvetica', 'bold')
+      doc.text('SECTION 5 — CONSOLIDATED FINANCIAL SUMMARY', ml + 6, y + 2)
+      y += 15
+
+      const formulaRows = [
+        { step: '1', label: 'Total Revenue (Sales Book)', value: `GHS ${fmt(totalRevenue)}`, source: 'SUM(sales_book.total_sales_ghs)', highlight: null },
+        { step: '', label: 'SXP litres dispensed', value: fmtL(totalSXP), source: 'fuel_type = SXP', highlight: null },
+        { step: '', label: 'DXP litres dispensed', value: fmtL(totalDXP), source: 'fuel_type = DXP', highlight: null },
+        { step: '', label: 'Total litres dispensed', value: fmtL(totalLitres), source: 'SXP + DXP', highlight: null },
+        { step: '2', label: 'Dealer Earnings', value: `GHS ${fmt(dealerEarnings)}`, source: `Total litres × GHS ${margin}/L`, highlight: 'green' },
+        { step: '3', label: 'Total Expenses', value: `GHS ${fmt(totalExpenses)}`, source: 'SUM(expenses.amount_ghs)', highlight: null },
+        { step: '4', label: noExpenses ? 'DEALER MARGIN BEFORE EXPENSES *' : 'NET DEALER PROFIT *', value: `GHS ${fmt(netDealerProfit)}`, source: 'Dealer Earnings - Total Expenses', highlight: netDealerProfit >= 0 ? 'green' : 'red' },
+      ]
+
+      formulaRows.forEach((row, idx) => {
+        checkPage(12)
+        if (row.highlight === 'green') {
+          doc.setFillColor(...GREEN_LIGHT)
+          doc.rect(ml, y - 5, cw, 10, 'F')
+        } else if (row.highlight === 'red') {
+          doc.setFillColor(...RED_LIGHT)
+          doc.rect(ml, y - 5, cw, 10, 'F')
+        } else if (idx % 2 === 0) {
+          doc.setFillColor(...LIGHT_ASH)
+          doc.rect(ml, y - 5, cw, 10, 'F')
+        }
+
+        if (row.step) {
+          doc.setFillColor(...ORANGE)
+          doc.rect(ml, y - 5, 10, 10, 'F')
+          doc.setTextColor(...WHITE)
+          doc.setFontSize(8)
+          doc.setFont('helvetica', 'bold')
+          doc.text(`Step ${row.step}`, ml + 1, y)
+        }
+
+        doc.setFont('helvetica', row.step || row.highlight ? 'bold' : 'normal')
+        doc.setFontSize(9)
+        if (row.highlight === 'green') doc.setTextColor(...GREEN)
+        else if (row.highlight === 'red') doc.setTextColor(...RED)
+        else doc.setTextColor(...DARK_GREY)
+        doc.text(row.label, ml + 13, y)
+        doc.text(row.value, pw - mr, y, { align: 'right' })
+
+        doc.setFont('helvetica', 'normal')
+        doc.setFontSize(7)
+        doc.setTextColor(...MID_GREY)
+        doc.text(row.source, ml + 13, y + 4)
+        y += 13
+      })
+
+      y += 4
+      doc.setFontSize(7)
+      doc.setFont('helvetica', 'italic')
+      doc.setTextColor(...MID_GREY)
+      doc.text(`* Total Revenue is shown for audit purposes only. Dealer income = GHS ${margin}/L margin, not total revenue.`, ml, y)
+      y += 12
+
+      // ── SECTION 6: STOCK MOVEMENT ──────────────────────
+      checkPage(60)
+      doc.setFillColor(...DARK_GREY)
+      doc.rect(ml, y - 5, cw, 10, 'F')
+      doc.setFillColor(...ORANGE)
+      doc.rect(ml, y - 5, 3, 10, 'F')
+      doc.setTextColor(...WHITE)
+      doc.setFontSize(10)
+      doc.setFont('helvetica', 'bold')
+      doc.text('SECTION 6 — MONTHLY STOCK MOVEMENT', ml + 6, y + 2)
+      y += 15
+
+      const { sxp: sxpStock, dxp: dxpStock } = data.section6_summary
+      const sxpOpening = sxpStock.opening
+      const sxpReceived = sxpStock.received
+      const sxpSold = sxpStock.sold
+      const sxpClosing = sxpStock.closing
+      const dxpOpening = dxpStock.opening
+      const dxpReceived = dxpStock.received
+      const dxpSold = dxpStock.sold
+      const dxpClosing = dxpStock.closing
+      const sxpVar = sxpStock.variance
+      const dxpVar = dxpStock.variance
+
+      const stockRows = [
+        ['Opening stock — 1st of month', fmtL(sxpOpening), fmtL(dxpOpening), fmtL(sxpOpening + dxpOpening)],
+        ['Total received this month', fmtL(sxpReceived), fmtL(dxpReceived), fmtL(sxpReceived + dxpReceived)],
+        ['Total sold this month', fmtL(sxpSold), fmtL(dxpSold), fmtL(sxpSold + dxpSold)],
+        ['Expected closing stock', fmtL(sxpOpening + sxpReceived - sxpSold), fmtL(dxpOpening + dxpReceived - dxpSold), fmtL(sxpOpening + sxpReceived - sxpSold + dxpOpening + dxpReceived - dxpSold)],
+        ['Actual closing stock (last dip)', fmtL(sxpClosing), fmtL(dxpClosing), fmtL(sxpClosing + dxpClosing)],
+      ]
+
+      const sWidths = [70, 35, 35, 40]
+      doc.setFillColor(...ASH)
+      doc.rect(ml, y - 4, cw, 7, 'F')
+      doc.setTextColor(...ORANGE)
+      doc.setFontSize(8)
+      doc.setFont('helvetica', 'bold')
+      x = ml
+      ;['Metric', 'SXP (Tank A)', 'DXP (Tank B)', 'Combined'].forEach((h, i) => { doc.text(h, x + 1, y); x += sWidths[i] })
+      y += 5
+
+      stockRows.forEach((row, idx) => {
+        checkPage(7)
+        if (idx % 2 === 0) { doc.setFillColor(...LIGHT_ASH); doc.rect(ml, y - 4, cw, 7, 'F') }
+        doc.setFont('helvetica', 'normal')
+        doc.setTextColor(...DARK_GREY)
+        doc.setFontSize(8)
+        x = ml
+        row.forEach((cell, i) => { doc.text(String(cell), x + 1, y); x += sWidths[i] })
+        y += 7
+      })
+
+      checkPage(8)
+      doc.setFillColor(...ASH)
+      doc.rect(ml, y - 4, cw, 8, 'F')
+      doc.setFont('helvetica', 'bold')
+      doc.setFontSize(8)
+      doc.text('Net variance', ml + 1, y)
+      const varCols = [sxpVar, dxpVar, sxpVar + dxpVar]
+      let vx = ml + sWidths[0]
+      varCols.forEach((v, i) => {
+        doc.setTextColor(...(v >= 0 ? GREEN : RED))
+        doc.text(`${v >= 0 ? '+' : ''}${fmtL(v)}`, vx + 1, y)
+        vx += sWidths[i + 1]
+      })
+      y += 12
+
+      // ── SECTION 10: VARIANCE RECONCILIATION ────────────
+      const vr = data.section10_variance_reconciliation
+      sectionBar('SECTION 10 — VARIANCE RECONCILIATION')
+      if (!vr || !vr.available) {
+        paragraph(vr?.reason || 'Not available for this period.', { color: MID_GREY, style: 'italic' })
+      } else {
+        const vw = [78, 34, 34, 34]
+        const va = ['l', 'r', 'r', 'r']
+        tableHead(['Metric', 'SXP (Tank A)', 'DXP (Tank B)', 'Combined'], vw, va)
+        const vcol = (n) => (Math.abs(n) < 0.005 ? DARK_GREY : n > 0 ? GREEN : RED)
+        tableRow(['Net tank variance (closing dip vs expected)', `${sgn(vr.sxp.variance)} L`, `${sgn(vr.dxp.variance)} L`, `${sgn(vr.combined.variance)} L`], vw, va, { idx: 0, colors: [DARK_GREY, vcol(vr.sxp.variance), vcol(vr.dxp.variance), vcol(vr.combined.variance)] })
+        tableRow(['Less: RTT litres (returned to tank)', fmtL(vr.sxp.rtt), fmtL(vr.dxp.rtt), fmtL(vr.combined.rtt)], vw, va, { idx: 1 })
+        tableRow(['UNEXPLAINED RESIDUE', `${sgn(vr.sxp.unexplained)} L`, `${sgn(vr.dxp.unexplained)} L`, `${sgn(vr.combined.unexplained)} L`], vw, va, { idx: 2, bold: true, colors: [DARK_GREY, vcol(vr.sxp.unexplained), vcol(vr.dxp.unexplained), vcol(vr.combined.unexplained)] })
+        y += 3
+        callout(vr.text, vr.needs_review ? 'warning' : 'positive')
+        if (vr.shortage_available) {
+          paragraph(`Delivery shortages this month (reference only): SXP ${fmtL(vr.sxp.shortage)}, DXP ${fmtL(vr.dxp.shortage)}.`, { size: 8 })
+        } else {
+          paragraph('Delivery shortages could not be loaded for this report.', { size: 8, color: AMBER_TXT })
+        }
+        footnote('RTT is the only explainable component: tank "sold" litres are the meter litres, so fuel returned to the tank shows as a positive variance of that size. Delivery shortage is NOT subtracted - the tank variance already uses the litres actually measured on arrival, so a shortage is already out of it. Shortage only explains the gap between expected (waybill) and actual variance. Tank stock, meters and RTT are all read on the same business-day window (tank rows are entered the morning after the day they close), so tank "sold" equals the meter litres for the month.')
+      }
+
+      // ── SECTION 11: CREDITOR EXPOSURE ──────────────────
+      const ce = data.section11_creditor_exposure
+      sectionBar('SECTION 11 — CREDITOR EXPOSURE')
+      if (!ce || ce.creditors.length === 0) {
+        paragraph('No credit activity for this period.', { color: MID_GREY, style: 'italic' })
+      } else {
+        const cwid = [58, 30, 30, 32, 30]
+        const cal = ['l', 'r', 'r', 'r', 'l']
+        tableHead(['Creditor', 'Credit sales', 'Payments', 'Net change', 'Direction'], cwid, cal)
+        ce.creditors.forEach((c, i) => {
+          const dirColor = c.direction === 'growing' ? RED : c.direction === 'shrinking' ? GREEN : DARK_GREY
+          tableRow([
+            c.name.length > 30 ? c.name.slice(0, 29) + '.' : c.name,
+            `GHS ${fmt(c.credit_sales)}`,
+            c.payments === null ? 'n/a' : `GHS ${fmt(c.payments)}`,
+            c.net_change === null ? 'n/a' : `${sgn(c.net_change)}`,
+            '  ' + c.direction.toUpperCase(),
+          ], cwid, cal, { idx: i, colors: [DARK_GREY, DARK_GREY, DARK_GREY, dirColor, dirColor] })
+        })
+        y += 3
+        if (ce.balances_available) {
+          subHead('CREDIT RISK')
+          const kw2 = [58, 32, 32, 28, 30]
+          const ka2 = ['l', 'r', 'r', 'r', 'r']
+          tableHead(['Creditor', 'Balance (est.)', 'Credit limit', 'Days owed', 'Share of credit'], kw2, ka2)
+          ce.creditors.filter(c => c.closing_balance !== null).forEach((c, i) => {
+            tableRow([
+              c.name.length > 30 ? c.name.slice(0, 29) + '.' : c.name,
+              `GHS ${fmt(c.closing_balance)}`,
+              c.credit_limit > 0 ? `GHS ${fmt(c.credit_limit)}` : 'NONE SET',
+              c.days_outstanding === null || c.days_outstanding === undefined ? 'n/a' : `${c.days_outstanding.toFixed(0)} days`,
+              pctTxt(c.share_of_credit_pct),
+            ], kw2, ka2, { idx: i, colors: [DARK_GREY, DARK_GREY, c.credit_limit > 0 ? DARK_GREY : RED, DARK_GREY, DARK_GREY] })
+          })
+          y += 2
+          ce.creditors.filter(c => c.limit_missing).forEach(c => {
+            callout(`${c.name} owes an estimated GHS ${fmt(c.closing_balance)} but has no credit limit set, so the credit-limit warning cannot fire. Set a limit on the Creditors screen.`, 'warning')
+          })
+          footnote('Days owed = balance / average daily credit sales: roughly how many days of this creditor\'s buying are still unpaid. Share of credit = this creditor\'s part of all credit sales in the month.')
+        }
+        ce.creditors.filter(c => c.direction === 'growing').forEach(c => {
+          callout(`${c.name}: balance grew by GHS ${fmt(c.net_change)} this month. Collected ${pctTxt(c.collection_rate_pct)} of what was extended - a growing balance is a risk, not a neutral fact.`, 'warning')
+        })
+        ce.creditors.filter(c => c.direction === 'shrinking').forEach(c => {
+          callout(`${c.name}: balance shrank by GHS ${fmt(Math.abs(c.net_change))} this month (payments exceeded new credit).`, 'positive')
+        })
+        if (!ce.payments_available) callout('Creditor payments could not be loaded - net change and direction are unavailable.', 'warning')
+        if (ce.balances_available) {
+          ce.creditors.filter(c => c.closing_balance !== null).forEach(c => {
+            paragraph(`${c.name} - ${ce.is_current_month ? 'balance now' : 'estimated month-end balance'} GHS ${fmt(c.closing_balance)} of GHS ${fmt(c.credit_limit)} limit (${pctTxt(c.utilisation_pct)} used)${c.opening_balance_est === null ? '' : `; estimated opening balance GHS ${fmt(c.opening_balance_est)}`}.`, { size: 8 })
+          })
+        } else {
+          paragraph('Balances could not be rebuilt for this report.', { size: 8, color: AMBER_TXT })
+        }
+        if (Math.abs(ce.credit_source_gap) > 1) {
+          callout(`The Sales Book credit column totals GHS ${fmt(ce.sales_book_merka)} but recorded credit sales total GHS ${fmt(ce.total_credit_sales)} (difference GHS ${fmt(Math.abs(ce.credit_source_gap))}). One of them was keyed wrong; creditor balances follow the credit sales.`, 'warning')
+        }
+        if (Math.abs(ce.credit_source_gap) > 1 && (ce.credit_source_gap_days || []).length > 0) {
+          const gd = ce.credit_source_gap_days
+          paragraph(`Gap by date: ${gd.slice(0, 6).map(g => `${g.date} (${sgn(g.gap)})`).join(', ')}${gd.length > 6 ? ` (+${gd.length - 6} more)` : ''}. Check the slips for those dates.`, { size: 8 })
+        }
+        paragraph(`Credit sales were ${pctTxt(ce.credit_share_of_revenue_pct)} of total revenue (GHS ${fmt(ce.total_credit_sales)}; revenue basis: ${ce.revenue_basis}).`, { size: 8.5 })
+        footnote('Net change = credit sales - payments received in the month. Month-end balance is rebuilt from today\'s balance by undoing everything recorded after the month; opening = month-end - net change. Both are estimates: the system clamps balances at zero, so an overpayment makes them slightly off.')
+      }
+
+      // ── SECTION 12: BANKING HEALTH CHECK ───────────────
+      const bh = data.section12_banking_health
+      sectionBar('SECTION 12 — BANKING HEALTH CHECK')
+      if (!bh || !bh.available) {
+        paragraph(bh?.reason || 'Not available for this period.', { color: MID_GREY, style: 'italic' })
+      } else {
+        const bw = [120, 60]
+        const ba = ['l', 'r']
+        tableHead(['Item', 'GHS'], bw, ba)
+        tableRow(['Sales Book total (all channels, Section 2)', fmt(bh.gross_sales)], bw, ba, { idx: 0 })
+        tableRow(['Less: Credit sales (not banked)', `-${fmt(bh.merka_credit)}`], bw, ba, { idx: 1 })
+        tableRow([bh.payments_available ? 'Add: Creditor payments received (banked later)' : 'Add: Creditor payments (could not be loaded)', bh.payments_available ? `+${fmt(bh.merka_payments)}` : 'n/a'], bw, ba, { idx: 2 })
+        tableRow(['Expected to be banked', fmt(bh.expected_banked)], bw, ba, { idx: 3, bold: true })
+        tableRow(['Total banked (Section 3)', fmt(bh.total_banked)], bw, ba, { idx: 4, bold: true })
+        tableRow([bh.gap > 0.005 ? 'Banked LESS than expected by' : 'Banked MORE than expected by', fmt(Math.abs(bh.gap))], bw, ba, { idx: 5, bold: true, colors: [DARK_GREY, bh.gap > 0.005 ? RED : GREEN] })
+        y += 3
+        if (bh.flagged_windows.length === 0) {
+          callout(`No sustained banking lag: the running gap never stayed above one day of average sales (GHS ${fmt(bh.threshold_ghs)}) for more than 2 consecutive days.`, 'positive')
+        } else {
+          bh.flagged_windows.forEach(w => callout(`Banking lagged sales from ${w.from} to ${w.to} (${w.days} days): the running gap stayed above one day of average sales (GHS ${fmt(bh.threshold_ghs)}), peaking at GHS ${fmt(w.peak_gap_ghs)}.`, 'warning'))
+        }
+        footnote(`Method: running (sales - credit sales) minus running banked, day by day, on business dates; flagged when above one day of average sales for more than 2 consecutive days. ${bh.note}`)
+      }
+
+      // ── SECTION 13: NOZZLE AND METER CHECKS ────────────
+      const mcx = data.section13_meter_checks
+      sectionBar('SECTION 13 — NOZZLE AND METER CHECKS')
+      if (!mcx || mcx.reported_days === 0) {
+        paragraph('No meter readings for this period.', { color: MID_GREY, style: 'italic' })
+      } else {
+        subHead('ZERO-SALES NOZZLES')
+        const fuelGaps = mcx.fuel_zero_days || []
+        fuelGaps.forEach(f => {
+          callout(`No ${f.fuel_type} sales on ANY nozzle on ${f.dates.length} day(s) while the station traded (MM-DD): ${dateList(f.dates)}. This is a fuel-level gap, not one faulty nozzle - check whether ${f.tank || 'the tank'} ran out of stock.`, 'warning')
+        })
+        if (mcx.zero_nozzles.length === 0 && fuelGaps.length === 0) {
+          callout('Every nozzle recorded sales on every day the station traded.', 'positive')
+        } else {
+          mcx.zero_nozzles.forEach(n => {
+            if (n.zero_dates.length > 0) callout(`${n.pump_id} ${n.fuel_type} had no net sales on ${n.zero_dates.length} day(s) the station traded (MM-DD): ${dateList(n.zero_dates)}.`, 'warning')
+            if (n.missing_dates.length > 0) callout(`${n.pump_id} ${n.fuel_type} has no reading at all on ${n.missing_dates.length} day(s) other nozzles were recorded (MM-DD): ${dateList(n.missing_dates)}.`, 'warning')
+          })
+        }
+        if (mcx.closed_dates.length > 0) {
+          paragraph(`Days with zero sales on every nozzle (treated as closed, not listed per nozzle): ${dateList(mcx.closed_dates)}.`, { size: 8, color: MID_GREY })
+        }
+        footnote('No net sales = zero litres, or litres fully returned to the tank (a nozzle test). The system holds no fault or maintenance records, so every such day on a trading day is listed; deciding which were genuine downtime is left to the reader.')
+
+        subHead('METER DATA CHECKS')
+        if (mcx.implausible_rows.length === 0 && mcx.continuity_breaks.length === 0) {
+          callout(`All meter readings passed: none above ${fmt(mcx.ceiling_litres)} L or negative on a single nozzle row, and every opening reading matched the prior closing.`, 'positive')
+        }
+        mcx.implausible_rows.forEach(r => {
+          callout(`${r.date} ${r.pump_id} ${r.fuel_type}: ${r.issue === 'negative' ? 'NEGATIVE' : 'implausible'} litres (${fmt(r.litres)} L; opening ${fmt(r.opening_meter)}, closing ${fmt(r.closing_meter)}). Report totals include this row as recorded - correct it in Meter Book.`, 'critical')
+        })
+        mcx.continuity_breaks.forEach(b => {
+          callout(`${b.date} ${b.pump_id} ${b.fuel_type}: opening ${fmt(b.opening)} does not match prior closing ${fmt(b.previous_closing)} (difference ${sgn(b.jump)}). Expected if the meter was replaced or reset; otherwise a typing error.`, 'warning')
+        })
+        footnote(`Ceiling: ${fmt(mcx.ceiling_litres)} L on one nozzle row. Continuity is checked within the month only - the first reading of the month has no earlier reading to compare with.`)
+      }
+
+      // ── SECTION 14: COMPLIANCE EXPIRY ──────────────────
+      const cx = data.section14_compliance_expiry
+      sectionBar('SECTION 14 — COMPLIANCE EXPIRY')
+      if (!cx || cx.items.length === 0) {
+        paragraph(`No certificate is expired or due to expire within ${cx?.horizon_days || 60} days of ${cx?.as_of || 'today'}.`, { color: MID_GREY, style: 'italic' })
+      } else {
+        const kw = [80, 32, 28, 40]
+        const ka = ['l', 'l', 'r', 'l']
+        tableHead(['Certificate', 'Expiry date', 'Days left', 'Status'], kw, ka)
+        cx.items.forEach((c, i) => {
+          const col = c.severity === 'critical' ? RED : c.severity === 'warning' ? AMBER_TXT : DARK_GREY
+          tableRow([
+            c.certificate_name.length > 40 ? c.certificate_name.slice(0, 39) + '.' : c.certificate_name,
+            c.expiry_date,
+            c.days_left < 0 ? `${Math.abs(c.days_left)} ago` : String(c.days_left),
+            c.severity === 'critical' ? 'EXPIRED' : c.severity === 'warning' ? 'Due within 30 days' : 'Due in 31-60 days',
+          ], kw, ka, { idx: i, colors: [DARK_GREY, DARK_GREY, col, col] })
+        })
+        y += 3
+      }
+      footnote(`Measured from the report generation date (${cx?.as_of || 'today'}), not month-end. Archived and deleted certificates are not shown.`)
+
+      // ══ PART B — DAILY DETAIL (reference) ═══════════════════════════════
+      // Everything above is the insight layer (what happened, what needs attention). Everything below is
+      // the day-by-day record the insights are built from — useful for checking a figure, not for reading.
+      newPage()
+      doc.setFillColor(...ORANGE)
+      doc.rect(ml, y - 5, cw, 14, 'F')
+      doc.setTextColor(...WHITE)
+      doc.setFontSize(12)
+      doc.setFont('helvetica', 'bold')
+      doc.text('PART B — DAILY DETAIL (REFERENCE)', ml + 6, y + 4)
+      y += 18
+      paragraph('The pages before this one hold the summaries and checks. The tables that follow are the day-by-day records they are built from: meter readings by pump (Section 1), Sales Book (2), Banking (3), credit sales (4) and dealer margin (7).', { size: 8, color: MID_GREY, style: 'italic', gap: 6 })
+      sectionBar('SECTION 1 (continued) — DAY-BY-DAY DETAIL')
 
       const s1Headers = ['Pump', 'Fuel', 'Litres Sold', 'Amount (GHS)', 'RTT (L)']
       const s1Widths = [30, 25, 40, 55, 30]
       const meterByDate = groupByDate(meter, 'reading_date')
-      let x = ml
 
       meterByDate.forEach(({ date, rows }) => {
         // Try to keep a whole day's block together rather than splitting
@@ -549,7 +945,7 @@ export default function Reports() {
         checkPage(6 + 5 + rows.length * 7 + 4)
 
         const dayLitres = rows.reduce((s, r) => s + parseFloat(r.litres_sold || 0), 0)
-        const dayAmount = rows.reduce((s, r) => s + parseFloat(r.amount_ghs || 0), 0)
+        const dayAmount = rows.reduce((s, r) => s + netOfRtt(r), 0) // net of RTT, same basis as every other revenue figure
         doc.setFillColor(...ORANGE)
         doc.rect(ml, y - 4, cw, 7, 'F')
         doc.setTextColor(...WHITE)
@@ -588,14 +984,14 @@ export default function Reports() {
       x = ml
       // Was GHS ${fmt(totalRevenue)} (the Sales Book total), which did not equal the sum of the daily
       // meter amounts printed above it — on the September report 1,881,709.00 vs 1,888,053.77.
-      const s1Totals = ['MONTH TOTAL', '', fmtL(totalLitres), `GHS ${fmt(meter.reduce((s, r) => s + parseFloat(r.amount_ghs || 0), 0))}`, fmtL(meter.reduce((s, r) => s + parseFloat(r.rtt_litres || 0), 0))]
+      const s1Totals = ['MONTH TOTAL', '', fmtL(totalLitres), `GHS ${fmt(meter.reduce((s, r) => s + netOfRtt(r), 0))}`, fmtL(meter.reduce((s, r) => s + parseFloat(r.rtt_litres || 0), 0))]
       s1Totals.forEach((cell, i) => { doc.text(String(cell), x + 1, y); x += s1Widths[i] })
       y += 10
 
       doc.setFont('helvetica', 'italic')
       doc.setFontSize(7)
       doc.setTextColor(...MID_GREY)
-      doc.text('RTT = Return to Tank. Stock event only — excluded from all revenue totals.', ml, y)
+      doc.text('Day headers and the month total are NET of RTT (litres returned to the tank are a stock event, never revenue); the rows show each nozzle as metered.', ml, y)
       y += 4
       doc.text('Dates shown are business dates, corrected for a confirmed one-day system-entry lag — one day earlier than the raw recorded date.', ml, y)
       y += 8
@@ -816,140 +1212,6 @@ export default function Reports() {
       doc.text('Dates shown are business dates, corrected for a confirmed one-day system-entry lag.', ml, y)
       y += 8
 
-      // ── SECTION 5: CONSOLIDATED ────────────────────────
-      newPage()
-      doc.setFillColor(...DARK_GREY)
-      doc.rect(ml, y - 5, cw, 10, 'F')
-      doc.setFillColor(...ORANGE)
-      doc.rect(ml, y - 5, 3, 10, 'F')
-      doc.setTextColor(...WHITE)
-      doc.setFontSize(10)
-      doc.setFont('helvetica', 'bold')
-      doc.text('SECTION 5 — CONSOLIDATED FINANCIAL SUMMARY', ml + 6, y + 2)
-      y += 15
-
-      const formulaRows = [
-        { step: '1', label: 'Total Revenue (Sales Book)', value: `GHS ${fmt(totalRevenue)}`, source: 'SUM(sales_book.total_sales_ghs)', highlight: null },
-        { step: '', label: 'SXP litres dispensed', value: fmtL(totalSXP), source: 'fuel_type = SXP', highlight: null },
-        { step: '', label: 'DXP litres dispensed', value: fmtL(totalDXP), source: 'fuel_type = DXP', highlight: null },
-        { step: '', label: 'Total litres dispensed', value: fmtL(totalLitres), source: 'SXP + DXP', highlight: null },
-        { step: '2', label: 'Dealer Earnings', value: `GHS ${fmt(dealerEarnings)}`, source: `Total litres × GHS ${margin}/L`, highlight: 'green' },
-        { step: '3', label: 'Total Expenses', value: `GHS ${fmt(totalExpenses)}`, source: 'SUM(expenses.amount_ghs)', highlight: null },
-        { step: '4', label: 'NET DEALER PROFIT *', value: `GHS ${fmt(netDealerProfit)}`, source: 'Dealer Earnings - Total Expenses', highlight: netDealerProfit >= 0 ? 'green' : 'red' },
-      ]
-
-      formulaRows.forEach((row, idx) => {
-        checkPage(12)
-        if (row.highlight === 'green') {
-          doc.setFillColor(...GREEN_LIGHT)
-          doc.rect(ml, y - 5, cw, 10, 'F')
-        } else if (row.highlight === 'red') {
-          doc.setFillColor(...RED_LIGHT)
-          doc.rect(ml, y - 5, cw, 10, 'F')
-        } else if (idx % 2 === 0) {
-          doc.setFillColor(...LIGHT_ASH)
-          doc.rect(ml, y - 5, cw, 10, 'F')
-        }
-
-        if (row.step) {
-          doc.setFillColor(...ORANGE)
-          doc.rect(ml, y - 5, 10, 10, 'F')
-          doc.setTextColor(...WHITE)
-          doc.setFontSize(8)
-          doc.setFont('helvetica', 'bold')
-          doc.text(`Step ${row.step}`, ml + 1, y)
-        }
-
-        doc.setFont('helvetica', row.step || row.highlight ? 'bold' : 'normal')
-        doc.setFontSize(9)
-        if (row.highlight === 'green') doc.setTextColor(...GREEN)
-        else if (row.highlight === 'red') doc.setTextColor(...RED)
-        else doc.setTextColor(...DARK_GREY)
-        doc.text(row.label, ml + 13, y)
-        doc.text(row.value, pw - mr, y, { align: 'right' })
-
-        doc.setFont('helvetica', 'normal')
-        doc.setFontSize(7)
-        doc.setTextColor(...MID_GREY)
-        doc.text(row.source, ml + 13, y + 4)
-        y += 13
-      })
-
-      y += 4
-      doc.setFontSize(7)
-      doc.setFont('helvetica', 'italic')
-      doc.setTextColor(...MID_GREY)
-      doc.text(`* Total Revenue is shown for audit purposes only. Dealer income = GHS ${margin}/L margin, not total revenue.`, ml, y)
-      y += 12
-
-      // ── SECTION 6: STOCK MOVEMENT ──────────────────────
-      checkPage(60)
-      doc.setFillColor(...DARK_GREY)
-      doc.rect(ml, y - 5, cw, 10, 'F')
-      doc.setFillColor(...ORANGE)
-      doc.rect(ml, y - 5, 3, 10, 'F')
-      doc.setTextColor(...WHITE)
-      doc.setFontSize(10)
-      doc.setFont('helvetica', 'bold')
-      doc.text('SECTION 6 — MONTHLY STOCK MOVEMENT', ml + 6, y + 2)
-      y += 15
-
-      const { sxp: sxpStock, dxp: dxpStock } = data.section6_summary
-      const sxpOpening = sxpStock.opening
-      const sxpReceived = sxpStock.received
-      const sxpSold = sxpStock.sold
-      const sxpClosing = sxpStock.closing
-      const dxpOpening = dxpStock.opening
-      const dxpReceived = dxpStock.received
-      const dxpSold = dxpStock.sold
-      const dxpClosing = dxpStock.closing
-      const sxpVar = sxpStock.variance
-      const dxpVar = dxpStock.variance
-
-      const stockRows = [
-        ['Opening stock — 1st of month', fmtL(sxpOpening), fmtL(dxpOpening), fmtL(sxpOpening + dxpOpening)],
-        ['Total received this month', fmtL(sxpReceived), fmtL(dxpReceived), fmtL(sxpReceived + dxpReceived)],
-        ['Total sold this month', fmtL(sxpSold), fmtL(dxpSold), fmtL(sxpSold + dxpSold)],
-        ['Expected closing stock', fmtL(sxpOpening + sxpReceived - sxpSold), fmtL(dxpOpening + dxpReceived - dxpSold), fmtL(sxpOpening + sxpReceived - sxpSold + dxpOpening + dxpReceived - dxpSold)],
-        ['Actual closing stock (last dip)', fmtL(sxpClosing), fmtL(dxpClosing), fmtL(sxpClosing + dxpClosing)],
-      ]
-
-      const sWidths = [70, 35, 35, 40]
-      doc.setFillColor(...ASH)
-      doc.rect(ml, y - 4, cw, 7, 'F')
-      doc.setTextColor(...ORANGE)
-      doc.setFontSize(8)
-      doc.setFont('helvetica', 'bold')
-      x = ml
-      ;['Metric', 'SXP (Tank A)', 'DXP (Tank B)', 'Combined'].forEach((h, i) => { doc.text(h, x + 1, y); x += sWidths[i] })
-      y += 5
-
-      stockRows.forEach((row, idx) => {
-        checkPage(7)
-        if (idx % 2 === 0) { doc.setFillColor(...LIGHT_ASH); doc.rect(ml, y - 4, cw, 7, 'F') }
-        doc.setFont('helvetica', 'normal')
-        doc.setTextColor(...DARK_GREY)
-        doc.setFontSize(8)
-        x = ml
-        row.forEach((cell, i) => { doc.text(String(cell), x + 1, y); x += sWidths[i] })
-        y += 7
-      })
-
-      checkPage(8)
-      doc.setFillColor(...ASH)
-      doc.rect(ml, y - 4, cw, 8, 'F')
-      doc.setFont('helvetica', 'bold')
-      doc.setFontSize(8)
-      doc.text('Net variance', ml + 1, y)
-      const varCols = [sxpVar, dxpVar, sxpVar + dxpVar]
-      let vx = ml + sWidths[0]
-      varCols.forEach((v, i) => {
-        doc.setTextColor(...(v >= 0 ? GREEN : RED))
-        doc.text(`${v >= 0 ? '+' : ''}${fmtL(v)}`, vx + 1, y)
-        vx += sWidths[i + 1]
-      })
-      y += 12
-
       // ── SECTION 7: DEALER MARGIN ───────────────────────
       checkPage(40)
       doc.setFillColor(...GREEN)
@@ -960,288 +1222,27 @@ export default function Reports() {
       doc.text(`SECTION 7 — DEALER MARGIN SUMMARY (GHS ${margin}/L)`, ml + 2, y + 2)
       y += 12
 
-      const s7Headers = ['Pump', 'Fuel', 'Litres Dispensed', 'Rate (GHS/L)', 'Dealer Earnings']
-      const s7Widths = [25, 25, 45, 35, 50]
-
-      meterByDate.forEach(({ date, rows }) => {
-        checkPage(6 + 5 + rows.length * 7 + 4)
-
-        const dayLitres = rows.reduce((s, r) => s + parseFloat(r.litres_sold || 0), 0)
-        const dayEarnings = dayLitres * margin
-        doc.setFillColor(...GREEN)
-        doc.rect(ml, y - 4, cw, 7, 'F')
-        doc.setTextColor(...WHITE)
-        doc.setFont('helvetica', 'bold')
-        doc.setFontSize(8)
-        doc.text(date, ml + 2, y)
-        doc.text(`${fmtL(dayLitres)}  ·  GHS ${fmt(dayEarnings)}`, pw - mr - 1, y, { align: 'right' })
-        y += 6
-
-        doc.setFillColor(...GREEN_LIGHT)
-        doc.rect(ml, y - 4, cw, 6, 'F')
-        doc.setTextColor(...GREEN)
-        doc.setFontSize(7)
-        let hx = ml
-        s7Headers.forEach((h, i) => { doc.text(h, hx + 1, y); hx += s7Widths[i] })
-        y += 5
-
-        doc.setFont('helvetica', 'normal')
-        rows.forEach((r, idx) => {
-          checkPage(7)
-          if (idx % 2 === 0) { doc.setFillColor(...LIGHT_ASH); doc.rect(ml, y - 4, cw, 7, 'F') }
-          let rx = ml
-          const earnings = parseFloat(r.litres_sold) * margin
-          const row = [r.pump_id, r.fuel_type, fmtL(r.litres_sold), String(margin), `GHS ${fmt(earnings)}`]
-          row.forEach((cell, i) => {
-            doc.setTextColor(...(i === 4 ? GREEN : DARK_GREY))
-            doc.text(String(cell), rx + 1, y)
-            rx += s7Widths[i]
-          })
-          y += 7
-        })
-        y += 3
+      // One line per day (PRD 5.15): earnings are simply litres x rate, so the per-pump rows that used to be
+      // repeated here added no information — the per-pump litres are in Section 1.
+      const s7Widths = [32, 30, 30, 30, 22, 36]
+      const s7Aligns = ['l', 'r', 'r', 'r', 'r', 'r']
+      tableHead(['Date', 'SXP litres', 'DXP litres', 'Total litres', 'Rate', 'Dealer earnings'], s7Widths, s7Aligns)
+      meterByDate.forEach(({ date, rows }, i) => {
+        const sxpL = rows.filter(r => r.fuel_type === 'SXP').reduce((t, r) => t + parseFloat(r.litres_sold || 0), 0)
+        const dxpL = rows.filter(r => r.fuel_type === 'DXP').reduce((t, r) => t + parseFloat(r.litres_sold || 0), 0)
+        tableRow([date, fmt(sxpL), fmt(dxpL), fmt(sxpL + dxpL), String(margin), `GHS ${fmt((sxpL + dxpL) * margin)}`],
+          s7Widths, s7Aligns, { idx: i, colors: [DARK_GREY, DARK_GREY, DARK_GREY, DARK_GREY, DARK_GREY, GREEN] })
       })
-
-      checkPage(10)
-      doc.setFillColor(...GREEN_LIGHT)
-      doc.rect(ml, y - 4, cw, 10, 'F')
-      doc.setFont('helvetica', 'bold')
-      doc.setFontSize(9)
-      doc.setTextColor(...DARK_GREY)
-      doc.text('MONTHLY TOTAL', ml + 1, y)
-      doc.text(fmtL(totalLitres), ml + s7Widths[0] + s7Widths[1] + 1, y)
-      doc.setTextColor(...GREEN)
-      doc.setFontSize(11)
-      doc.text(`GHS ${fmt(dealerEarnings)}`, pw - mr, y, { align: 'right' })
-      y += 12
+      y += 1
+      tableRow(['MONTHLY TOTAL', fmt(totalSXP), fmt(totalDXP), fmt(totalLitres), String(margin), `GHS ${fmt(dealerEarnings)}`],
+        s7Widths, s7Aligns, { idx: 0, bold: true, colors: [DARK_GREY, DARK_GREY, DARK_GREY, DARK_GREY, DARK_GREY, GREEN] })
+      y += 6
 
       doc.setFont('helvetica', 'italic')
       doc.setFontSize(7)
       doc.setTextColor(...MID_GREY)
       doc.text('Dates shown are business dates, corrected for a confirmed one-day system-entry lag.', ml, y)
       y += 8
-
-      // ── SECTION 8: SALES VOLUME AVERAGES ───────────────
-      const s8 = data.section8_volume_averages || { weeks: [], monthly: { sxp_weekly_avg: 0, dxp_weekly_avg: 0, combined_weekly_avg: 0 } }
-      checkPage(50)
-      doc.setFillColor(...DARK_GREY)
-      doc.rect(ml, y - 5, cw, 10, 'F')
-      doc.setFillColor(...ORANGE)
-      doc.rect(ml, y - 5, 3, 10, 'F')
-      doc.setTextColor(...WHITE)
-      doc.setFontSize(10)
-      doc.setFont('helvetica', 'bold')
-      doc.text('SECTION 8 — SALES VOLUME AVERAGES', ml + 6, y + 2)
-      y += 15
-
-      const s8Headers = ['Week', 'Days', 'SXP total (avg/day)', 'DXP total (avg/day)', 'Combined total (avg/day)']
-      const s8Widths = [36, 12, 42, 42, 48]
-      doc.setFillColor(...ASH)
-      doc.rect(ml, y - 4, cw, 7, 'F')
-      doc.setTextColor(...ORANGE)
-      doc.setFontSize(7.5)
-      doc.setFont('helvetica', 'bold')
-      x = ml
-      s8Headers.forEach((h, i) => { doc.text(h, x + 1, y); x += s8Widths[i] })
-      y += 5
-
-      s8.weeks.forEach((w, idx) => {
-        checkPage(7)
-        if (idx % 2 === 0) { doc.setFillColor(...LIGHT_ASH); doc.rect(ml, y - 4, cw, 7, 'F') }
-        doc.setFont('helvetica', 'normal')
-        doc.setTextColor(...DARK_GREY)
-        doc.setFontSize(7.5)
-        x = ml
-        const row = [
-          `W${w.week} (${w.label})`,
-          String(w.days_in_bucket),
-          `${fmtL(w.sxp_total)} (${fmtL(w.sxp_daily_avg)})`,
-          `${fmtL(w.dxp_total)} (${fmtL(w.dxp_daily_avg)})`,
-          `${fmtL(w.combined_total)} (${fmtL(w.combined_daily_avg)})`,
-        ]
-        row.forEach((cell, i) => { doc.text(String(cell), x + 1, y); x += s8Widths[i] })
-        y += 7
-      })
-
-      if (s8.weeks.length === 0) {
-        doc.setFont('helvetica', 'italic')
-        doc.setFontSize(8)
-        doc.setTextColor(...MID_GREY)
-        doc.text('No meter readings for this period.', ml + 1, y)
-        y += 7
-      }
-
-      checkPage(12)
-      doc.setFillColor(...ASH)
-      doc.rect(ml, y - 4, cw, 10, 'F')
-      doc.setFont('helvetica', 'bold')
-      doc.setFontSize(8)
-      doc.setTextColor(...DARK_GREY)
-      doc.text('MONTHLY WEEKLY AVERAGE', ml + 1, y)
-      doc.text(`SXP ${fmtL(s8.monthly.sxp_weekly_avg)}`, ml + s8Widths[0] + s8Widths[1] + 1, y)
-      doc.text(`DXP ${fmtL(s8.monthly.dxp_weekly_avg)}`, ml + s8Widths[0] + s8Widths[1] + s8Widths[2] + 1, y)
-      doc.text(`Combined ${fmtL(s8.monthly.combined_weekly_avg)}`, pw - mr, y, { align: 'right' })
-      y += 12
-
-      doc.setFont('helvetica', 'italic')
-      doc.setFontSize(7)
-      doc.setTextColor(...MID_GREY)
-      doc.text('Week-of-month buckets (not calendar weeks); the trailing bucket is short and included as-is in the monthly average.', ml, y)
-      y += 8
-
-      // ── SECTION 9: HEADLINE CALLOUTS ───────────────────
-      const headlines = data.section9_headlines || []
-      sectionBar('SECTION 9 — HEADLINE CALLOUTS')
-      if (headlines.length === 0) paragraph('No meter readings for this period.', { color: MID_GREY, style: 'italic' })
-      headlines.forEach(h => callout(h.text, h.tone))
-      footnote('Volume and pace callouts use litres, not revenue, because NPA price changes distort revenue comparisons between months. Pace is measured per day with a meter entry, so a short trailing week cannot fake a slowdown.')
-
-      // ── SECTION 10: VARIANCE RECONCILIATION ────────────
-      const vr = data.section10_variance_reconciliation
-      sectionBar('SECTION 10 — VARIANCE RECONCILIATION')
-      if (!vr || !vr.available) {
-        paragraph(vr?.reason || 'Not available for this period.', { color: MID_GREY, style: 'italic' })
-      } else {
-        const vw = [78, 34, 34, 34]
-        const va = ['l', 'r', 'r', 'r']
-        tableHead(['Metric', 'SXP (Tank A)', 'DXP (Tank B)', 'Combined'], vw, va)
-        const vcol = (n) => (Math.abs(n) < 0.005 ? DARK_GREY : n > 0 ? GREEN : RED)
-        tableRow(['Net tank variance (closing dip vs expected)', `${sgn(vr.sxp.variance)} L`, `${sgn(vr.dxp.variance)} L`, `${sgn(vr.combined.variance)} L`], vw, va, { idx: 0, colors: [DARK_GREY, vcol(vr.sxp.variance), vcol(vr.dxp.variance), vcol(vr.combined.variance)] })
-        tableRow(['Less: RTT litres (returned to tank)', fmtL(vr.sxp.rtt), fmtL(vr.dxp.rtt), fmtL(vr.combined.rtt)], vw, va, { idx: 1 })
-        tableRow(['UNEXPLAINED RESIDUE', `${sgn(vr.sxp.unexplained)} L`, `${sgn(vr.dxp.unexplained)} L`, `${sgn(vr.combined.unexplained)} L`], vw, va, { idx: 2, bold: true, colors: [DARK_GREY, vcol(vr.sxp.unexplained), vcol(vr.dxp.unexplained), vcol(vr.combined.unexplained)] })
-        y += 3
-        callout(vr.text, vr.needs_review ? 'warning' : 'positive')
-        if (vr.shortage_available) {
-          paragraph(`Delivery shortages this month (reference only): SXP ${fmtL(vr.sxp.shortage)}, DXP ${fmtL(vr.dxp.shortage)}.`, { size: 8 })
-        } else {
-          paragraph('Delivery shortages could not be loaded for this report.', { size: 8, color: AMBER_TXT })
-        }
-        footnote('RTT is the only explainable component: tank "sold" litres are the meter litres, so fuel returned to the tank shows as a positive variance of that size. Delivery shortage is NOT subtracted - the tank variance already uses the litres actually measured on arrival, so a shortage is already out of it. Shortage only explains the gap between expected (waybill) and actual variance. RTT is taken from the same business-date window as Section 1, tank variance from raw stock dates, so a one-day boundary mismatch is possible.')
-      }
-
-      // ── SECTION 11: CREDITOR EXPOSURE ──────────────────
-      const ce = data.section11_creditor_exposure
-      sectionBar('SECTION 11 — CREDITOR EXPOSURE')
-      if (!ce || ce.creditors.length === 0) {
-        paragraph('No credit activity for this period.', { color: MID_GREY, style: 'italic' })
-      } else {
-        const cwid = [58, 30, 30, 32, 30]
-        const cal = ['l', 'r', 'r', 'r', 'l']
-        tableHead(['Creditor', 'Credit sales', 'Payments', 'Net change', 'Direction'], cwid, cal)
-        ce.creditors.forEach((c, i) => {
-          const dirColor = c.direction === 'growing' ? RED : c.direction === 'shrinking' ? GREEN : DARK_GREY
-          tableRow([
-            c.name.length > 30 ? c.name.slice(0, 29) + '.' : c.name,
-            `GHS ${fmt(c.credit_sales)}`,
-            c.payments === null ? 'n/a' : `GHS ${fmt(c.payments)}`,
-            c.net_change === null ? 'n/a' : `${sgn(c.net_change)}`,
-            '  ' + c.direction.toUpperCase(),
-          ], cwid, cal, { idx: i, colors: [DARK_GREY, DARK_GREY, DARK_GREY, dirColor, dirColor] })
-        })
-        y += 3
-        ce.creditors.filter(c => c.direction === 'growing').forEach(c => {
-          callout(`${c.name}: balance grew by GHS ${fmt(c.net_change)} this month. Collected ${pctTxt(c.collection_rate_pct)} of what was extended - a growing balance is a risk, not a neutral fact.`, 'warning')
-        })
-        ce.creditors.filter(c => c.direction === 'shrinking').forEach(c => {
-          callout(`${c.name}: balance shrank by GHS ${fmt(Math.abs(c.net_change))} this month (payments exceeded new credit).`, 'positive')
-        })
-        if (!ce.payments_available) callout('Creditor payments could not be loaded - net change and direction are unavailable.', 'warning')
-        if (ce.balances_available) {
-          ce.creditors.filter(c => c.closing_balance !== null).forEach(c => {
-            paragraph(`${c.name} - ${ce.is_current_month ? 'balance now' : 'estimated month-end balance'} GHS ${fmt(c.closing_balance)} of GHS ${fmt(c.credit_limit)} limit (${pctTxt(c.utilisation_pct)} used)${c.opening_balance_est === null ? '' : `; estimated opening balance GHS ${fmt(c.opening_balance_est)}`}.`, { size: 8 })
-          })
-        } else {
-          paragraph('Balances could not be rebuilt for this report.', { size: 8, color: AMBER_TXT })
-        }
-        if (Math.abs(ce.credit_source_gap) > 1) {
-          callout(`The Sales Book credit column totals GHS ${fmt(ce.sales_book_merka)} but recorded credit sales total GHS ${fmt(ce.total_credit_sales)} (difference GHS ${fmt(Math.abs(ce.credit_source_gap))}). One of them was keyed wrong; creditor balances follow the credit sales.`, 'warning')
-        }
-        paragraph(`Credit sales were ${pctTxt(ce.credit_share_of_revenue_pct)} of total revenue (GHS ${fmt(ce.total_credit_sales)}; revenue basis: ${ce.revenue_basis}).`, { size: 8.5 })
-        footnote('Net change = credit sales - payments received in the month. Month-end balance is rebuilt from today\'s balance by undoing everything recorded after the month; opening = month-end - net change. Both are estimates: the system clamps balances at zero, so an overpayment makes them slightly off.')
-      }
-
-      // ── SECTION 12: BANKING HEALTH CHECK ───────────────
-      const bh = data.section12_banking_health
-      sectionBar('SECTION 12 — BANKING HEALTH CHECK')
-      if (!bh || !bh.available) {
-        paragraph(bh?.reason || 'Not available for this period.', { color: MID_GREY, style: 'italic' })
-      } else {
-        const bw = [120, 60]
-        const ba = ['l', 'r']
-        tableHead(['Item', 'GHS'], bw, ba)
-        tableRow(['Sales Book total (all channels, Section 2)', fmt(bh.gross_sales)], bw, ba, { idx: 0 })
-        tableRow(['Less: Credit sales (not banked)', `-${fmt(bh.merka_credit)}`], bw, ba, { idx: 1 })
-        tableRow([bh.payments_available ? 'Add: Creditor payments received (banked later)' : 'Add: Creditor payments (could not be loaded)', bh.payments_available ? `+${fmt(bh.merka_payments)}` : 'n/a'], bw, ba, { idx: 2 })
-        tableRow(['Expected to be banked', fmt(bh.expected_banked)], bw, ba, { idx: 3, bold: true })
-        tableRow(['Total banked (Section 3)', fmt(bh.total_banked)], bw, ba, { idx: 4, bold: true })
-        tableRow([bh.gap > 0.005 ? 'Banked LESS than expected by' : 'Banked MORE than expected by', fmt(Math.abs(bh.gap))], bw, ba, { idx: 5, bold: true, colors: [DARK_GREY, bh.gap > 0.005 ? RED : GREEN] })
-        y += 3
-        if (bh.flagged_windows.length === 0) {
-          callout(`No sustained banking lag: the running gap never stayed above one day of average sales (GHS ${fmt(bh.threshold_ghs)}) for more than 2 consecutive days.`, 'positive')
-        } else {
-          bh.flagged_windows.forEach(w => callout(`Banking lagged sales from ${w.from} to ${w.to} (${w.days} days): the running gap stayed above one day of average sales (GHS ${fmt(bh.threshold_ghs)}), peaking at GHS ${fmt(w.peak_gap_ghs)}.`, 'warning'))
-        }
-        footnote(`Method: running (sales - credit sales) minus running banked, day by day, on business dates; flagged when above one day of average sales for more than 2 consecutive days. ${bh.note}`)
-      }
-
-      // ── SECTION 13: NOZZLE AND METER CHECKS ────────────
-      const mcx = data.section13_meter_checks
-      sectionBar('SECTION 13 — NOZZLE AND METER CHECKS')
-      if (!mcx || mcx.reported_days === 0) {
-        paragraph('No meter readings for this period.', { color: MID_GREY, style: 'italic' })
-      } else {
-        subHead('ZERO-SALES NOZZLES')
-        const fuelGaps = mcx.fuel_zero_days || []
-        fuelGaps.forEach(f => {
-          callout(`No ${f.fuel_type} sales on ANY nozzle on ${f.dates.length} day(s) while the station traded (MM-DD): ${dateList(f.dates)}. This is a fuel-level gap, not one faulty nozzle - check whether ${f.tank || 'the tank'} ran out of stock.`, 'warning')
-        })
-        if (mcx.zero_nozzles.length === 0 && fuelGaps.length === 0) {
-          callout('Every nozzle recorded sales on every day the station traded.', 'positive')
-        } else {
-          mcx.zero_nozzles.forEach(n => {
-            if (n.zero_dates.length > 0) callout(`${n.pump_id} ${n.fuel_type} had no net sales on ${n.zero_dates.length} day(s) the station traded (MM-DD): ${dateList(n.zero_dates)}.`, 'warning')
-            if (n.missing_dates.length > 0) callout(`${n.pump_id} ${n.fuel_type} has no reading at all on ${n.missing_dates.length} day(s) other nozzles were recorded (MM-DD): ${dateList(n.missing_dates)}.`, 'warning')
-          })
-        }
-        if (mcx.closed_dates.length > 0) {
-          paragraph(`Days with zero sales on every nozzle (treated as closed, not listed per nozzle): ${dateList(mcx.closed_dates)}.`, { size: 8, color: MID_GREY })
-        }
-        footnote('No net sales = zero litres, or litres fully returned to the tank (a nozzle test). The system holds no fault or maintenance records, so every such day on a trading day is listed; deciding which were genuine downtime is left to the reader.')
-
-        subHead('METER DATA CHECKS')
-        if (mcx.implausible_rows.length === 0 && mcx.continuity_breaks.length === 0) {
-          callout(`All meter readings passed: none above ${fmt(mcx.ceiling_litres)} L or negative on a single nozzle row, and every opening reading matched the prior closing.`, 'positive')
-        }
-        mcx.implausible_rows.forEach(r => {
-          callout(`${r.date} ${r.pump_id} ${r.fuel_type}: ${r.issue === 'negative' ? 'NEGATIVE' : 'implausible'} litres (${fmt(r.litres)} L; opening ${fmt(r.opening_meter)}, closing ${fmt(r.closing_meter)}). Report totals include this row as recorded - correct it in Meter Book.`, 'critical')
-        })
-        mcx.continuity_breaks.forEach(b => {
-          callout(`${b.date} ${b.pump_id} ${b.fuel_type}: opening ${fmt(b.opening)} does not match prior closing ${fmt(b.previous_closing)} (difference ${sgn(b.jump)}). Expected if the meter was replaced or reset; otherwise a typing error.`, 'warning')
-        })
-        footnote(`Ceiling: ${fmt(mcx.ceiling_litres)} L on one nozzle row. Continuity is checked within the month only - the first reading of the month has no earlier reading to compare with.`)
-      }
-
-      // ── SECTION 14: COMPLIANCE EXPIRY ──────────────────
-      const cx = data.section14_compliance_expiry
-      sectionBar('SECTION 14 — COMPLIANCE EXPIRY')
-      if (!cx || cx.items.length === 0) {
-        paragraph(`No certificate is expired or due to expire within ${cx?.horizon_days || 60} days of ${cx?.as_of || 'today'}.`, { color: MID_GREY, style: 'italic' })
-      } else {
-        const kw = [80, 32, 28, 40]
-        const ka = ['l', 'l', 'r', 'l']
-        tableHead(['Certificate', 'Expiry date', 'Days left', 'Status'], kw, ka)
-        cx.items.forEach((c, i) => {
-          const col = c.severity === 'critical' ? RED : c.severity === 'warning' ? AMBER_TXT : DARK_GREY
-          tableRow([
-            c.certificate_name.length > 40 ? c.certificate_name.slice(0, 39) + '.' : c.certificate_name,
-            c.expiry_date,
-            c.days_left < 0 ? `${Math.abs(c.days_left)} ago` : String(c.days_left),
-            c.severity === 'critical' ? 'EXPIRED' : c.severity === 'warning' ? 'Due within 30 days' : 'Due in 31-60 days',
-          ], kw, ka, { idx: i, colors: [DARK_GREY, DARK_GREY, col, col] })
-        })
-        y += 3
-      }
-      footnote(`Measured from the report generation date (${cx?.as_of || 'today'}), not month-end. Archived and deleted certificates are not shown.`)
 
       // ── FOOTER on all pages ────────────────────────────
       const totalPages = doc.getNumberOfPages()

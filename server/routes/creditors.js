@@ -37,6 +37,39 @@ router.post('/', authenticate, adminOrManager, async (req, res) => {
   }
 });
 
+// PUT /api/creditors/:id/credit-limit
+// A creditor's limit could only be set when the creditor was created, so a
+// creditor added with no limit (the default 0) had no way to be given one
+// afterwards, and the report's credit-limit warning could never fire for them.
+// Only the limit is editable here — name/contact changes are out of scope.
+// 0 is allowed and means "no limit set" (the report flags a balance with no limit).
+router.put('/:id/credit-limit', authenticate, adminOrManager, async (req, res) => {
+  try {
+    const raw = req.body.credit_limit_ghs;
+    const limit = typeof raw === 'string' ? raw.trim() : raw;
+    if ((typeof limit !== 'number' && typeof limit !== 'string') || limit === '' || !Number.isFinite(Number(limit)) || Number(limit) < 0) {
+      return res.status(400).json({ error: 'credit_limit_ghs must be a non-negative number' });
+    }
+    if (Number(limit) > 9999999999) {
+      return res.status(400).json({ error: 'credit_limit_ghs is too large' });
+    }
+
+    const { data, error } = await req.supabaseAdmin
+      .from('creditors')
+      .update({ credit_limit_ghs: Number(limit) })
+      .eq('id', req.params.id)
+      .is('deleted_at', null)
+      .select()
+      .maybeSingle();
+
+    if (error) return res.status(500).json({ error: error.message });
+    if (!data) return res.status(404).json({ error: 'Creditor not found' });
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to update credit limit' });
+  }
+});
+
 // PUT /api/creditors/:id/deactivate
 // For a creditor who has left. Deliberately refuses while a balance is
 // still owed: Reports' creditor-exposure section and the credit-limit

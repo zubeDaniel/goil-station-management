@@ -32,7 +32,20 @@ function monthDateRange(month) {
 // pump_meter_readings, sales_book, and credit_sales — NOT banking (which
 // is deliberately filed by physical deposit-slip date, a separate,
 // intentional lag per the PRD — stacking this fix on top of that one would
-// be wrong) and NOT tank_stock (dip readings aren't reported as lagged).
+// be wrong). tank_stock was originally left out of this list on the belief that
+// dip readings aren't lagged — the database showed otherwise (see TANK STOCK below),
+// so tank_stock IS lagged and is now handled like the meter readings.
+//
+// TANK STOCK: a tank_stock row dated D is entered the morning of D and closes the
+// business day D-1. Evidence (September 2026, read directly from the database): the
+// row dated 2026-09-01 has litres_sold 999.52 SXP / 1,869.97 DXP, which is exactly the
+// meter total for business day 31 Aug (stored under 1 Sep); each row's opening_stock is
+// the previous row's closing dip; and a tanker delivery_date D lands in the row dated
+// D+1. With the plain calendar window, "September" tank figures were actually business
+// 31 Aug - 29 Sep: tank "sold" disagreed with the meters by one day of sales at each end
+// of the month, "closing stock" was the 29 Sep evening dip, and a delivery on 30 Sep was
+// missed. With the lagged window below, tank "sold" equals the meters exactly and
+// opening + received - sold + variance = closing holds for the true month.
 //
 // This is a report-generation-only fix: raw stored dates are never
 // altered, no migration, no change to what the entry forms save. Two
@@ -109,7 +122,8 @@ async function getMonthlyFuelRevenue(supabaseAdmin, month) {
 // field: reasonable starting values, worth tuning after real usage, not
 // worth blocking this feature on building a settings UI for them first.
 const FLAG_THRESHOLDS = {
-  revenueSwingPct: 0.10,     // ±10% MoM revenue change
+  revenueSwingPct: 0.10,     // ±10% MoM revenue change (Sales Book basis — only when both months are comparable)
+  volumeSwingPct: 0.10,      // ±10% MoM litres change — the primary month-on-month comparison
   tankVarianceLitres: 50,    // |actual_variance| on any single tank_stock day
   creditorExposurePct: 0.80, // balance / credit_limit
   unexplainedVariancePct: 0.005, // |monthly unexplained tank residue| / litres sold
@@ -118,16 +132,38 @@ const FLAG_THRESHOLDS = {
 // Deterministic, rule-based — no AI narration (matches what was agreed:
 // deterministic only, PDF only). Every flag here traces to a specific
 // number already computed elsewhere in this file; nothing is generated.
-function computeFlags({ current, previousSection5, creditors, compliance, today, isCurrentMonth }) {
+function computeFlags({ current, previousSection5, salesBookComparable = true, salesBookGap = null, creditors, compliance, today, isCurrentMonth }) {
   const flags = [];
 
-  if (previousSection5 && previousSection5.total_revenue > 0) {
-    const delta = (current.section5_consolidated.total_revenue - previousSection5.total_revenue) / previousSection5.total_revenue;
-    if (Math.abs(delta) >= FLAG_THRESHOLDS.revenueSwingPct) {
+  // Month-on-month is led by LITRES: a dealer is paid per litre, and litres do not depend on
+  // which Sales Book channels were being recorded or on NPA price moves.
+  if (previousSection5 && previousSection5.total_litres > 0) {
+    const litresDelta = (current.section5_consolidated.total_litres - previousSection5.total_litres) / previousSection5.total_litres;
+    if (Math.abs(litresDelta) >= FLAG_THRESHOLDS.volumeSwingPct) {
       flags.push({
-        severity: delta > 0 ? 'positive' : 'warning',
-        message: `Total revenue ${delta > 0 ? 'up' : 'down'} ${Math.abs(delta * 100).toFixed(1)}% vs last month`,
+        severity: litresDelta > 0 ? 'positive' : 'warning',
+        message: `Litres dispensed ${litresDelta > 0 ? 'up' : 'down'} ${Math.abs(litresDelta * 100).toFixed(1)}% vs last month`,
       });
+    }
+  }
+
+  // Sales Book revenue is compared only when both months recorded the same channels. The cash
+  // channel was added to the Sales Book after the first months were keyed, so a month without it
+  // is missing most of its revenue and any comparison against it is a data artefact, not growth.
+  if (previousSection5 && previousSection5.total_revenue > 0) {
+    if (!salesBookComparable) {
+      flags.push({
+        severity: 'notice',
+        message: `Sales Book revenue is not compared with last month: ${salesBookGap || 'the two months do not record the same channels (one has no cash entries)'}, so the totals are not like-for-like. Compare litres instead.`,
+      });
+    } else {
+      const delta = (current.section5_consolidated.total_revenue - previousSection5.total_revenue) / previousSection5.total_revenue;
+      if (Math.abs(delta) >= FLAG_THRESHOLDS.revenueSwingPct) {
+        flags.push({
+          severity: delta > 0 ? 'positive' : 'warning',
+          message: `Sales Book revenue ${delta > 0 ? 'up' : 'down'} ${Math.abs(delta * 100).toFixed(1)}% vs last month`,
+        });
+      }
     }
   }
 
@@ -176,7 +212,7 @@ function computeFlags({ current, previousSection5, creditors, compliance, today,
     }
   });
 
-  const severityRank = { critical: 0, warning: 1, positive: 2 };
+  const severityRank = { critical: 0, warning: 1, positive: 2, notice: 3 };
   flags.sort((a, b) => severityRank[a.severity] - severityRank[b.severity]);
   return flags;
 }
@@ -312,7 +348,7 @@ function computeVolumeAverages(meterReadings, month) {
 // at this station's data volume (one station, a handful of report loads
 // a month). Revisit if generated_reports.snapshot_json ever gets a write
 // path and this becomes worth caching.
-async function assembleReport(supabaseAdmin, month) {
+async function assembleReport(supabaseAdmin, month, frozen = null) {
   const { startDate, endDate } = monthDateRange(month);
 
   const { data: setup } = await supabaseAdmin
@@ -320,11 +356,15 @@ async function assembleReport(supabaseAdmin, month) {
     .select('*')
     .single();
 
-  const margin = parseFloat(setup?.dealer_margin_per_litre || 0.30);
+  const liveMargin = parseFloat(setup?.dealer_margin_per_litre || 0.30);
+  // A closed month that was snapshotted keeps the margin rate it was first reported at, so a later
+  // change to station_setup.dealer_margin_per_litre cannot silently rewrite old Dealer Earnings.
+  const frozenMargin = frozen ? parseFloat(frozen.dealer_margin_per_litre) : NaN;
+  const margin = Number.isFinite(frozenMargin) ? frozenMargin : liveMargin;
 
-  // Lagged window for the three affected tables only — see shiftDateBack/
-  // shiftDateForward comment above. Banking, expenses, and tank_stock use
-  // the plain calendar startDate/endDate, untouched.
+  // Lagged window for the tables affected by the one-day entry lag — see the
+  // shiftDateBack/shiftDateForward comment above. Banking and expenses use the plain
+  // calendar startDate/endDate, untouched.
   const laggedStart = shiftDateForward(startDate);
   const laggedEnd = shiftDateForward(endDate);
 
@@ -358,7 +398,7 @@ async function assembleReport(supabaseAdmin, month) {
     // return first/last (insertion order), not actually day-1 and day-N.
     // This was already true before consolidation — moving it here just
     // means it's now wrong (or right) in exactly one place instead of two.
-    supabaseAdmin.from('tank_stock').select('*').gte('stock_date', startDate).lte('stock_date', endDate).order('stock_date', { ascending: true }),
+    supabaseAdmin.from('tank_stock').select('*').gte('stock_date', laggedStart).lte('stock_date', laggedEnd).order('stock_date', { ascending: true }),
   ]);
 
   // Relabel the lagged tables' rows back onto business dates now that the
@@ -378,7 +418,11 @@ async function assembleReport(supabaseAdmin, month) {
     .map(r => ({ ...r, sale_date: shiftDateBack(r.sale_date) }))
     .sort((a, b) => a.sale_date.localeCompare(b.sale_date));
   const expenses = expensesRes.data || [];
-  const tankStock = tankRes.data || [];
+  // Relabelled onto business dates like the meter rows, so every downstream date (e.g. the
+  // worst-variance day in the flags) is the day the stock actually moved.
+  const tankStock = (tankRes.data || [])
+    .map(r => ({ ...r, stock_date: shiftDateBack(r.stock_date) }))
+    .sort((a, b) => a.stock_date.localeCompare(b.stock_date) || String(a.tank_id).localeCompare(String(b.tank_id)));
 
   const totalSxpLitres = meterReadings.filter(r => r.fuel_type === 'SXP').reduce((s, r) => s + parseFloat(r.litres_sold || 0), 0);
   const totalDxpLitres = meterReadings.filter(r => r.fuel_type === 'DXP').reduce((s, r) => s + parseFloat(r.litres_sold || 0), 0);
@@ -402,6 +446,8 @@ async function assembleReport(supabaseAdmin, month) {
     setup: setup || null,
     station_name: setup?.station_name,
     dealer_margin_per_litre: margin,
+    dealer_margin_live: liveMargin,
+    margin_frozen: Number.isFinite(frozenMargin),
     section1_fuel_sales: meterReadings,
     section2_sales_book: salesBook,
     section3_banking: banking,
@@ -649,8 +695,9 @@ function computeVarianceReconciliation({ stockSummary, tankRowCount, meter, deli
 // opening/closing balances are shown ONLY when the report month is the
 // current one (opening is then closing - net change, an estimate: the
 // payment RPC clamps at zero, so an overpayment makes it slightly off).
-function computeCreditorExposure({ creditors, creditSales, payments, paymentsOk, postCredits, postPayments, postOk, salesBookMerka, totalRevenue, isCurrentMonth }) {
+function computeCreditorExposure({ creditors, creditSales, payments, paymentsOk, postCredits, postPayments, postOk, salesBookMerka, salesBook = [], totalRevenue, isCurrentMonth, frozenBalances = null, daysBasis = 30 }) {
   const rows = [];
+  const totalCreditAll = sumBy(creditSales, 'total_amount_ghs');
   (creditors || []).forEach(c => {
     const credits = sumBy(creditSales.filter(s => s.creditor_id === c.id), 'total_amount_ghs');
     const paid = paymentsOk ? sumBy(payments.filter(p => p.creditor_id === c.id), 'amount_ghs') : null;
@@ -660,15 +707,20 @@ function computeCreditorExposure({ creditors, creditSales, payments, paymentsOk,
     // recorded AFTER the month: closing = today - later credit + later payments.
     // This is what makes a just-closed month (the usual case: the report is
     // read in the first days of the next month) show real balances.
-    let closing = null;
+    let liveClosing = null;
     if (postOk) {
       const later = sumBy(postCredits.filter(s => s.creditor_id === c.id), 'total_amount_ghs');
       const laterPaid = sumBy(postPayments.filter(p => p.creditor_id === c.id), 'amount_ghs');
-      closing = Math.max(0, balance - later + laterPaid);
-    } else if (isCurrentMonth) closing = balance;
+      liveClosing = Math.max(0, balance - later + laterPaid);
+    } else if (isCurrentMonth) liveClosing = balance;
+    // A closed month that was snapshotted shows the balance frozen at the time, so the report is
+    // reproducible; liveClosing is kept alongside to show whether later records have moved it.
+    const frozenClosing = frozenBalances && frozenBalances[c.id] !== undefined ? num(frozenBalances[c.id]) : null;
+    const closing = frozenClosing !== null ? frozenClosing : liveClosing;
     if (credits === 0 && !(paid > 0) && !(closing > 0)) return;
     const limit = num(c.credit_limit_ghs);
     rows.push({
+      creditor_id: c.id,
       name: c.name,
       credit_sales: credits,
       payments: paid,
@@ -679,9 +731,27 @@ function computeCreditorExposure({ creditors, creditSales, payments, paymentsOk,
       opening_balance_est: closing !== null && paymentsOk ? Math.max(0, closing - net) : null,
       credit_limit: limit,
       utilisation_pct: closing !== null ? pct(closing, limit) : null,
+      // Credit risk views. Days outstanding = balance / average daily credit sales: roughly how many
+      // days of this creditor's buying the unpaid balance represents.
+      days_outstanding: closing !== null && credits > 0 ? closing / (credits / daysBasis) : null,
+      share_of_credit_pct: pct(credits, totalCreditAll),
+      // A balance with no limit means the limit warning can never fire for this creditor.
+      limit_missing: closing !== null && closing > 0 && limit <= 0,
+      balance_frozen: frozenClosing !== null,
+      live_closing_balance: liveClosing,
+      frozen_drift: frozenClosing !== null && liveClosing !== null ? liveClosing - frozenClosing : null,
     });
   });
-  const totalCredit = sumBy(creditSales, 'total_amount_ghs');
+  const totalCredit = totalCreditAll;
+  // Per-day comparison of the Sales Book credit column with the credit_sales entries, so a gap is
+  // reported with the date(s) it comes from rather than only as a monthly total.
+  const gapByDate = {};
+  (salesBook || []).forEach(sb => { gapByDate[sb.entry_date] = (gapByDate[sb.entry_date] || 0) + num(sb.merka_wood_ghs); });
+  creditSales.forEach(cs => { gapByDate[cs.sale_date] = (gapByDate[cs.sale_date] || 0) - num(cs.total_amount_ghs); });
+  const creditGapDays = Object.entries(gapByDate)
+    .filter(([, v]) => Math.abs(v) > 1)
+    .map(([date, v]) => ({ date, gap: v }))
+    .sort((a, b) => a.date.localeCompare(b.date));
   return {
     payments_available: paymentsOk,
     balances_available: postOk || isCurrentMonth,
@@ -694,6 +764,9 @@ function computeCreditorExposure({ creditors, creditSales, payments, paymentsOk,
     // a gap means one of the two was keyed wrong, and the creditor balance
     // follows credit_sales, not the Sales Book.
     credit_source_gap: salesBookMerka - totalCredit,
+    credit_source_gap_days: creditGapDays,
+    top_creditor_share_pct: rows.length > 0 ? Math.max(...rows.map(r => r.share_of_credit_pct || 0)) : null,
+    days_basis: daysBasis,
     credit_share_of_revenue_pct: pct(totalCredit, totalRevenue),
     revenue_basis: 'Sales Book total (all channels)',
   };
@@ -866,7 +939,7 @@ function computeComplianceExpiry({ compliance, today }) {
 }
 
 // Extra cover-page flags from the new analyses. Same shape as computeFlags.
-function buildExtraFlags({ variance, creditorExposure, banking, meterChecks, isCurrentMonth }) {
+function buildExtraFlags({ variance, creditorExposure, banking, meterChecks, isCurrentMonth, expensesTotal = 0, hasMeterData = false, marginNote = null }) {
   const flags = [];
   const d = (n) => Math.abs(n) >= 1000 ? nf(n, 0) : nf(n);
 
@@ -898,8 +971,24 @@ function buildExtraFlags({ variance, creditorExposure, banking, meterChecks, isC
     }
   });
   if (Math.abs(creditorExposure.credit_source_gap) > 1) {
-    flags.push({ severity: 'warning', message: `Sales Book credit column (GHS ${d(creditorExposure.sales_book_merka)}) differs from recorded credit sales (GHS ${d(creditorExposure.total_credit_sales)}) by GHS ${d(Math.abs(creditorExposure.credit_source_gap))} - one was keyed wrong. See Section 11.` });
+    const gd = creditorExposure.credit_source_gap_days || [];
+    const where = gd.length > 0
+      ? ` The gap comes from ${gd.length === 1 ? 'this date' : 'these dates'}: ${gd.slice(0, 4).map(g => `${g.date} (${signedNf(g.gap)})`).join(', ')}${gd.length > 4 ? ` (+${gd.length - 4} more)` : ''}.`
+      : '';
+    flags.push({ severity: 'warning', message: `Sales Book credit column (GHS ${d(creditorExposure.sales_book_merka)}) differs from recorded credit sales (GHS ${d(creditorExposure.total_credit_sales)}) by GHS ${d(Math.abs(creditorExposure.credit_source_gap))} - one was keyed wrong.${where} See Section 11.` });
   }
+  (creditorExposure.creditors || []).forEach(c => {
+    if (c.limit_missing) {
+      flags.push({ severity: 'warning', message: `${c.name} owes an estimated GHS ${d(c.closing_balance)} but has no credit limit set, so the credit-limit warning cannot fire. Set a limit on the Creditors screen.` });
+    }
+    if (c.balance_frozen && c.frozen_drift !== null && Math.abs(c.frozen_drift) > 1) {
+      flags.push({ severity: 'notice', message: `${c.name}: the month-end balance shown (GHS ${d(c.closing_balance)}) was frozen when this month was first reported; today's records rebuild it as GHS ${d(c.live_closing_balance)} (${signedNf(c.frozen_drift)}). A later correction or overpayment moved it.` });
+    }
+  });
+  if (hasMeterData && expensesTotal === 0) {
+    flags.push({ severity: 'warning', message: 'No expenses are recorded for this month, so "Net Dealer Profit" below is dealer margin BEFORE expenses, not profit. Log wages, power and other costs to see the real figure.' });
+  }
+  if (marginNote) flags.push({ severity: 'notice', message: marginNote });
   if (banking && banking.available && banking.flagged_windows.length > 0) {
     const w = banking.flagged_windows[0];
     flags.push({ severity: 'warning', message: `Banking lagged sales: gap above one day of sales from ${w.from} to ${w.to} (peak GHS ${d(w.peak_gap_ghs)}) - see Section 12.` });
@@ -915,7 +1004,26 @@ function buildExtraFlags({ variance, creditorExposure, banking, meterChecks, isC
 }
 
 // Assembles every new block for the current month's payload.
-function buildEnhancements({ month, current, trend, creditors, payments, paymentsOk, postCredits, postPayments, postOk, deliveries, deliveriesOk, compliance, today }) {
+// Price rows dated inside the month whose price DIFFERS from the one in force just before them. A row that only
+// restates the current price (or the very first price ever entered) is not a change.
+function priceChangesInMonth(priceRows, month) {
+  const { startDate, endDate } = monthDateRange(month);
+  const sorted = (priceRows || []).slice().sort((a, b) =>
+    String(a.effective_date).localeCompare(String(b.effective_date)) || String(a.effective_time || '').localeCompare(String(b.effective_time || '')));
+  const last = {};
+  const changes = [];
+  sorted.forEach(r => {
+    const price = num(r.price_per_litre);
+    const prev = last[r.fuel_type];
+    if (r.effective_date >= startDate && r.effective_date <= endDate && prev !== undefined && Math.abs(prev - price) > 1e-9) {
+      changes.push({ date: r.effective_date, time: r.effective_time || null, fuel_type: r.fuel_type, price, previous_price: prev });
+    }
+    last[r.fuel_type] = price;
+  });
+  return changes;
+}
+
+function buildEnhancements({ month, current, trend, creditors, payments, paymentsOk, postCredits, postPayments, postOk, deliveries, deliveriesOk, compliance, today, frozen = null, priceRows = [] }) {
   const meter = current.section1_fuel_sales;
   const isCurrentMonth = month === today.slice(0, 7);
 
@@ -934,7 +1042,10 @@ function buildEnhancements({ month, current, trend, creditors, payments, payment
     creditors, creditSales: current.section4_credit_sales, payments, paymentsOk,
     postCredits, postPayments, postOk,
     salesBookMerka: sumBy(current.section2_sales_book, 'merka_wood_ghs'),
+    salesBook: current.section2_sales_book,
     totalRevenue: current.section5_consolidated.total_revenue, isCurrentMonth,
+    frozenBalances: frozen && frozen.creditor_balances ? frozen.creditor_balances : null,
+    daysBasis: isCurrentMonth ? Math.max(1, parseInt(today.slice(8, 10), 10)) : daysInMonthOf(month),
   });
   const banking = computeBankingHealth({ salesBook: current.section2_sales_book, banking: current.section3_banking, month, payments, paymentsOk });
   const meterChecks = computeMeterChecks(meter);
@@ -962,8 +1073,61 @@ function buildEnhancements({ month, current, trend, creditors, payments, payment
     section13_meter_checks: meterChecks,
     section14_compliance_expiry: computeComplianceExpiry({ compliance, today }),
     generated_on: today,
-    extra_flags: buildExtraFlags({ variance, creditorExposure, banking, meterChecks, isCurrentMonth }),
+    // Price changes effective inside the month (from fuel_prices, the approved history), used to mark
+    // the daily chart. Not inferred from amount / litres.
+    price_changes: priceChangesInMonth(priceRows, month),
+    extra_flags: buildExtraFlags({
+      variance, creditorExposure, banking, meterChecks, isCurrentMonth,
+      expensesTotal: current.section5_consolidated.total_expenses,
+      hasMeterData: meter.length > 0,
+      marginNote: current.margin_frozen && Math.abs(current.dealer_margin_live - current.dealer_margin_per_litre) > 1e-9
+        ? `Dealer margin for this month is frozen at GHS ${current.dealer_margin_per_litre}/L (the rate when it was first reported); the current setting is GHS ${current.dealer_margin_live}/L and does not change this month's figures.`
+        : null,
+    }),
   };
+}
+
+// ── Month-close snapshot ─────────────────────────────────────────
+// generated_reports existed but nothing wrote to it. The first time a CLOSED month is generated, the
+// few figures that are NOT safely re-derivable later are frozen: the dealer margin rate (a single
+// current value in station_setup, no history), each creditor's month-end balance (rebuilt from today's
+// balance and clamped at zero, so an overpayment can skew it) and the prices effective in the month.
+// Everything else stays live on purpose: correcting a month's Sales Book or meter rows (e.g. backfilling
+// a missing channel) must flow into that month's report, not be locked out by an old snapshot.
+// To re-freeze a month, delete its row in generated_reports (is_preliminary = false) and regenerate.
+async function loadFrozen(supabaseAdmin, month) {
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('generated_reports')
+      .select('snapshot_json')
+      .eq('report_month', `${month}-01`)
+      .eq('is_preliminary', false)
+      .order('generated_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (error || !data || !data.snapshot_json) return null;
+    return data.snapshot_json.frozen || null;
+  } catch (e) {
+    console.error('Report snapshot read failed:', e.message);
+    return null;
+  }
+}
+
+async function saveFrozen(supabaseAdmin, month, userId, frozen) {
+  try {
+    const { error } = await supabaseAdmin.from('generated_reports').insert({
+      report_month: `${month}-01`,
+      generated_by: userId || null,
+      is_auto: false,
+      is_preliminary: false,
+      snapshot_json: { version: 1, captured_at: new Date().toISOString(), frozen },
+      notes: 'Captured automatically the first time this closed month was generated: dealer margin rate, creditor month-end balances, prices in the month.',
+    });
+    // 23505 = another request froze the same month first (partial unique index) — nothing to do.
+    if (error && error.code !== '23505') console.error('Report snapshot write failed:', error.message);
+  } catch (e) {
+    console.error('Report snapshot write failed:', e.message);
+  }
 }
 
 // GET /api/reports
@@ -997,26 +1161,34 @@ router.get('/:month', authenticate, adminOrManager, async (req, res) => {
     const { startDate, endDate } = monthDateRange(month);
     const today = new Date().toISOString().slice(0, 10);
 
-    const [current, previous, creditorsRes, complianceRes, deliveriesRes, paymentsRes, postCreditsRes, postPaymentsRes, ...trendResults] = await Promise.all([
-      assembleReport(req.supabaseAdmin, month),
-      assembleReport(req.supabaseAdmin, prevMonth),
+    // Snapshots (if any) are read first: a frozen margin changes what assembleReport computes.
+    const [frozen, frozenPrev] = await Promise.all([
+      loadFrozen(req.supabaseAdmin, month),
+      loadFrozen(req.supabaseAdmin, prevMonth),
+    ]);
+
+    const [current, previous, creditorsRes, complianceRes, deliveriesRes, paymentsRes, postCreditsRes, postPaymentsRes, priceRes, ...trendResults] = await Promise.all([
+      assembleReport(req.supabaseAdmin, month, frozen),
+      assembleReport(req.supabaseAdmin, prevMonth, frozenPrev),
       // creditors / compliance_certificates / creditor_payments all carry deleted_at — filtered.
       req.supabaseAdmin.from('creditors').select('id, name, current_balance_ghs, credit_limit_ghs, is_active').is('deleted_at', null),
       req.supabaseAdmin.from('compliance_certificates').select('certificate_name, issuing_authority, expiry_date, alert_days_before, status').is('deleted_at', null),
       // tanker_deliveries has NO deleted_at column — do not add that filter.
-      // A delivery is logged on its real arrival date D and counted by the tank stock
-      // entry dated D+1 (see tankstock.js). This month's tank rows are stock_date in
-      // [startDate, endDate], so the deliveries that feed them are delivery_date in
-      // [startDate-1, endDate-1]. Using the plain month window would put the shortage of
-      // a truck that arrives on the last day of a month in a different month from the
-      // tank row it explains.
-      req.supabaseAdmin.from('tanker_deliveries').select('delivery_date, fuel_type, tank_id, expected_litres, actual_litres, shortage_litres').gte('delivery_date', shiftDateBack(startDate)).lte('delivery_date', shiftDateBack(endDate)),
+      // A delivery is logged on its real arrival date D and counted by the tank stock entry
+      // dated D+1 (see tankstock.js). The report's tank rows are the lagged window, i.e. business
+      // days [startDate, endDate], so the deliveries that feed them are the plain calendar month
+      // delivery_date in [startDate, endDate] — a truck arriving on the last day of the month
+      // belongs to the same month as the tank row that counts it.
+      req.supabaseAdmin.from('tanker_deliveries').select('delivery_date, fuel_type, tank_id, expected_litres, actual_litres, shortage_litres').gte('delivery_date', startDate).lte('delivery_date', endDate),
       // Payments are not part of the one-day entry lag (only meter / sales / credit_sales are).
       req.supabaseAdmin.from('creditor_payments').select('creditor_id, payment_date, amount_ghs').gte('payment_date', startDate).lte('payment_date', endDate).is('deleted_at', null),
       // Everything recorded AFTER the month, to rebuild the month-end creditor balance
       // from today's balance. credit_sales rides the one-day lag, payments do not.
       req.supabaseAdmin.from('credit_sales').select('creditor_id, total_amount_ghs').gt('sale_date', shiftDateForward(endDate)).is('deleted_at', null),
       req.supabaseAdmin.from('creditor_payments').select('creditor_id, amount_ghs').gt('payment_date', endDate).is('deleted_at', null),
+      // fuel_prices is the approved price history (small table), read up to month-end so a row inside the month can be
+      // compared with the price in force before it; select('*') so this still works if effective_time is absent.
+      req.supabaseAdmin.from('fuel_prices').select('*').lte('effective_date', endDate).order('effective_date', { ascending: true }),
       ...trendMonths.map(m => getMonthlyFuelRevenue(req.supabaseAdmin, m)),
     ]);
 
@@ -1029,18 +1201,43 @@ router.get('/:month', authenticate, adminOrManager, async (req, res) => {
       postOk: !postCreditsRes.error && !postPaymentsRes.error,
       deliveries: deliveriesRes.data || [], deliveriesOk: !deliveriesRes.error,
       compliance: complianceRes.data || [],
-      today,
+      today, frozen,
+      priceRows: priceRes.error ? [] : (priceRes.data || []),
     });
     const { extra_flags, ...enhSections } = enh;
 
-    const severityRank = { critical: 0, warning: 1, positive: 2 };
+    const severityRank = { critical: 0, warning: 1, positive: 2, notice: 3 };
+    // Sales Book revenue is only comparable month to month when both months recorded the cash channel
+    // the same way (see computeFlags).
+    const hasCash = (rows) => sumBy(rows, 'physical_cash_ghs') > 0;
+    const prevCash = hasCash(previous.section2_sales_book);
+    const curCash = hasCash(current.section2_sales_book);
+    const salesBookComparable = prevCash === curCash;
+    const salesBookGap = prevCash === curCash ? null
+      : (prevCash ? 'this month\'s Sales Book has no cash entries yet' : 'last month\'s Sales Book has no cash entries');
     const flags = computeFlags({
       current,
       previousSection5: previous.has_data ? previous.section5_consolidated : null,
+      salesBookComparable, salesBookGap,
       creditors: creditorsRes.data || [],
       compliance: complianceRes.data || [],
       today, isCurrentMonth,
     }).concat(extra_flags).sort((a, b) => severityRank[a.severity] - severityRank[b.severity]);
+
+    // Freeze a closed month the first time it is generated (never the current month, never twice).
+    // Wait a few days past month-end first: the last business day is entered the morning after (and
+    // credit sales / payments for it later still), so freezing on the 1st would lock in a balance that
+    // is still missing the final day's entries.
+    const earliestFreeze = shiftDateForward(shiftDateForward(shiftDateForward(shiftDateForward(endDate))));
+    if (!frozen && today >= earliestFreeze && current.has_data && enhSections.section11_creditor_exposure.balances_available) {
+      const balances = {};
+      enhSections.section11_creditor_exposure.creditors.forEach(c => { if (c.closing_balance !== null) balances[c.creditor_id] = c.closing_balance; });
+      await saveFrozen(req.supabaseAdmin, month, req.user && req.user.id, {
+        dealer_margin_per_litre: current.dealer_margin_per_litre,
+        creditor_balances: balances,
+        price_changes: enhSections.price_changes,
+      });
+    }
 
     res.json({
       ...current,
@@ -1049,7 +1246,9 @@ router.get('/:month', authenticate, adminOrManager, async (req, res) => {
         month: prevMonth,
         has_data: previous.has_data,
         section5_consolidated: previous.section5_consolidated,
+        sales_book_comparable: salesBookComparable,
       },
+      month_frozen: !!frozen,
       flags,
       revenue_trend: trendResults,
     });

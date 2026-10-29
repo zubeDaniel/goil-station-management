@@ -17,6 +17,8 @@ export default function Creditors() {
   const [selectedCreditor, setSelectedCreditor] = useState(null)
   const [editingSaleId, setEditingSaleId] = useState(null)
   const [editingPaymentId, setEditingPaymentId] = useState(null)
+  const [editingLimitId, setEditingLimitId] = useState(null)
+  const [limitDraft, setLimitDraft] = useState('')
 
   const [saleForm, setSaleForm] = useState({
     sale_date: new Date().toISOString().split('T')[0],
@@ -153,6 +155,17 @@ export default function Creditors() {
       await loadData()
     } catch (err) {
       showToast('error', 'Could not deactivate', err.response?.data?.error)
+    }
+  }
+
+  const handleSaveLimit = async (c) => {
+    try {
+      await api.put(`/creditors/${c.id}/credit-limit`, { credit_limit_ghs: limitDraft })
+      showToast('success', 'Credit limit updated', `${c.name}: GHS ${parseFloat(limitDraft).toLocaleString()}`)
+      setEditingLimitId(null)
+      await loadData()
+    } catch (err) {
+      showToast('error', 'Could not update limit', err.response?.data?.error)
     }
   }
 
@@ -478,7 +491,26 @@ export default function Creditors() {
                 </div>
                 <div style={{ textAlign: 'center', padding: 10, background: 'var(--navy-light)', border: '1px solid var(--navy-border)', borderRadius: 'var(--r-md)' }}>
                   <div style={{ fontSize: 10, fontWeight: 600, color: 'var(--navy)', textTransform: 'uppercase', marginBottom: 4 }}>Credit limit</div>
-                  <div style={{ fontSize: 18, fontWeight: 700, color: 'var(--navy)', fontFamily: 'var(--font-mono)' }}>{parseFloat(c.credit_limit_ghs).toLocaleString()}</div>
+                  {editingLimitId === c.id ? (
+                    <div onClick={e => e.stopPropagation()} style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                      <input className="form-input" type="number" min="0" step="0.01" value={limitDraft} autoFocus
+                        onChange={e => setLimitDraft(e.target.value)}
+                        onKeyDown={e => { if (e.key === 'Enter') handleSaveLimit(c); if (e.key === 'Escape') setEditingLimitId(null) }} />
+                      <div style={{ display: 'flex', gap: 4, justifyContent: 'center' }}>
+                        <button className="btn btn-primary btn-sm" onClick={() => handleSaveLimit(c)}>Save</button>
+                        <button className="btn btn-ghost btn-sm" onClick={() => setEditingLimitId(null)}>Cancel</button>
+                      </div>
+                    </div>
+                  ) : (
+                    <>
+                      <div style={{ fontSize: 18, fontWeight: 700, color: 'var(--navy)', fontFamily: 'var(--font-mono)' }}>{parseFloat(c.credit_limit_ghs).toLocaleString()}</div>
+                      {parseFloat(c.credit_limit_ghs) <= 0 && <div style={{ fontSize: 10, color: 'var(--red)', fontWeight: 600 }}>No limit set</div>}
+                      <button className="btn btn-ghost btn-sm" style={{ marginTop: 4 }}
+                        onClick={e => { e.stopPropagation(); setEditingLimitId(c.id); setLimitDraft(String(parseFloat(c.credit_limit_ghs) || 0)) }}>
+                        <i className="ph ph-pencil-simple"></i> Edit
+                      </button>
+                    </>
+                  )}
                 </div>
                 <div style={{ textAlign: 'center', padding: 10, background: 'var(--amber-subtle)', border: '1px solid var(--amber-border)', borderRadius: 'var(--r-md)' }}>
                   <div style={{ fontSize: 10, fontWeight: 600, color: 'var(--amber)', textTransform: 'uppercase', marginBottom: 4 }}>Available</div>
